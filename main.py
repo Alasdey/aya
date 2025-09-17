@@ -72,7 +72,7 @@ def _system_prompt() -> str:
     return p.read_text(encoding="utf-8")
 
 def _sample_prompt() -> str:
-    return "Using your tools, what is the mean price across items? Also list items that mention 'mug'."
+    return "Use the coherence check tool with a made up sample to test it"
 
 if __name__ == "__main__":
     system = SystemMessage(_system_prompt())

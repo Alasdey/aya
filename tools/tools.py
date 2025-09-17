@@ -1,12 +1,13 @@
-# from __future__ import annotations
+from __future__ import annotations
 
 import json
 from pathlib import Path
 from statistics import mean
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 
 from langchain_core.tools import tool
 from langsmith.run_helpers import traceable  # <- LangSmith tracing
+
 
 DATASET_DEFAULT = Path(__file__).resolve().parents[1] / "data" / "sample.jsonl"
 
@@ -34,10 +35,89 @@ def _find_by_keyword_impl(keyword: str, dataset_path: str = str(DATASET_DEFAULT)
     return "[]" if not hits else json.dumps(hits, ensure_ascii=False)
 
 
+CAUSAL = {"CauseEffect", "EffectCause"}
+
+def _inverse_label(lab: str) -> str:
+    return {"CauseEffect": "EffectCause", "EffectCause": "CauseEffect"}.get(lab, lab)
+
+@traceable(name="tool:coherence_check", run_type="tool")
+def _coherence_check(
+    *,
+    pairs: List[Dict[str, str]],
+    conversation: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    LangSmith-traced function tool.
+
+    Args:
+        pairs: [{"pair":"Ti,Tj","label":"CauseEffect|EffectCause|NoRel"}, ...]
+        conversation: (optional) the running chat history; included only for trace context.
+
+    Returns:
+        {
+          "considered": int,
+          "symmetric_ok": List[List[str]],
+          "conflicts": List[{a,b,lab_ab,lab_ba,suggest_ba}],
+          "missing_reverse": List[{a,b,lab_ab,suggest_ba}],
+          "coherence_rate": float
+        }
+    """
+    dir_map: Dict[Tuple[str, str], str] = {}
+    for obj in pairs or []:
+        p = (obj.get("pair") or "").strip()
+        lab = (obj.get("label") or "").strip()
+        if p and lab and "," in p:
+            a, b = [t.strip() for t in p.split(",", 1)]
+            dir_map[(a, b)] = lab
+
+    unordered = set()
+    for (a, b) in dir_map:
+        if a != b:
+            unordered.add(tuple(sorted((a, b))))
+
+    considered = 0
+    symmetric_ok: List[List[str]] = []
+    conflicts: List[Dict[str, str]] = []
+    missing_reverse: List[Dict[str, str]] = []
+
+    for (x, y) in unordered:
+        lab_xy = dir_map.get((x, y))
+        lab_yx = dir_map.get((y, x))
+        cx = lab_xy in CAUSAL if lab_xy else False
+        cy = lab_yx in CAUSAL if lab_yx else False
+        if not (cx or cy):
+            continue
+
+        considered += 1
+        if lab_xy and lab_yx:
+            if (lab_xy, lab_yx) in (("CauseEffect", "EffectCause"), ("EffectCause", "CauseEffect")):
+                symmetric_ok.append([x, y])
+            else:
+                conflicts.append({
+                    "a": x, "b": y,
+                    "lab_ab": lab_xy, "lab_ba": lab_yx,
+                    "suggest_ba": _inverse_label(lab_xy) if lab_xy in CAUSAL else lab_yx
+                })
+        else:
+            if lab_xy in CAUSAL and not lab_yx:
+                missing_reverse.append({"a": x, "b": y, "lab_ab": lab_xy, "suggest_ba": _inverse_label(lab_xy)})
+            if lab_yx in CAUSAL and not lab_xy:
+                missing_reverse.append({"a": y, "b": x, "lab_ab": lab_yx, "suggest_ba": _inverse_label(lab_yx)})
+
+    rate = (len(symmetric_ok) / considered) if considered else 0.0
+    return {
+        "considered": considered,
+        "symmetric_ok": symmetric_ok,
+        "conflicts": conflicts,
+        "missing_reverse": missing_reverse,
+        "coherence_rate": rate
+    }
+
 # Wrap the traced functions as LangChain tools
 mean_price = tool(_mean_price_impl)
 find_by_keyword = tool(_find_by_keyword_impl)
+coherence_check = tool(_coherence_check)
 
 
 # This is really great
-TOOLS = [mean_price, find_by_keyword]
+TOOLS = [mean_price, find_by_keyword, coherence_check]
