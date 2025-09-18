@@ -40,8 +40,8 @@ CAUSAL = {"CauseEffect", "EffectCause"}
 def _inverse_label(lab: str) -> str:
     return {"CauseEffect": "EffectCause", "EffectCause": "CauseEffect"}.get(lab, lab)
 
-@traceable(name="tool:coherence_check", run_type="tool")
-def _coherence_check(
+@tool
+def coherence_check(
     *,
     pairs: List[Dict[str, str]],
     conversation: Optional[List[Dict[str, Any]]] = None,
@@ -116,7 +116,7 @@ def _coherence_check(
 # Wrap the traced functions as LangChain tools
 mean_price = tool(_mean_price_impl)
 find_by_keyword = tool(_find_by_keyword_impl)
-coherence_check = tool(_coherence_check)
+
 
 
 # This is really great
