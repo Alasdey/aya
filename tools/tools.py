@@ -19,7 +19,7 @@ def _load_rows(dataset_path: str | Path = DATASET_DEFAULT) -> List[Dict[str, Any
 
 
 @tool
-def _mean_price_impl(dataset_path: str = str(DATASET_DEFAULT)) -> str:
+def mean_price(dataset_path: str = str(DATASET_DEFAULT)) -> str:
     """Compute the mean price over all items in the JSONL dataset."""
     rows = _load_rows(dataset_path)
     prices = [float(r["price"]) for r in rows if "price" in r]
@@ -27,7 +27,7 @@ def _mean_price_impl(dataset_path: str = str(DATASET_DEFAULT)) -> str:
 
 
 @tool
-def _find_by_keyword_impl(keyword: str, dataset_path: str = str(DATASET_DEFAULT)) -> str:
+def find_by_keyword(keyword: str, dataset_path: str = str(DATASET_DEFAULT)) -> str:
     """Return items whose title or tags contain the keyword (case-insensitive)."""
     rows = _load_rows(dataset_path)
     k = keyword.lower().strip()
@@ -115,4 +115,4 @@ def coherence_check(
 
 
 # This is really great
-TOOLS = [mean_price, find_by_keyword, coherence_check]
+TOOLS = [coherence_check]
