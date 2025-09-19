@@ -18,7 +18,7 @@ def _load_rows(dataset_path: str | Path = DATASET_DEFAULT) -> List[Dict[str, Any
         return [json.loads(line) for line in f]
 
 
-@traceable(name="tool:mean_price", run_type="tool")
+@tool
 def _mean_price_impl(dataset_path: str = str(DATASET_DEFAULT)) -> str:
     """Compute the mean price over all items in the JSONL dataset."""
     rows = _load_rows(dataset_path)
@@ -26,7 +26,7 @@ def _mean_price_impl(dataset_path: str = str(DATASET_DEFAULT)) -> str:
     return f"{mean(prices):.2f}"
 
 
-@traceable(name="tool:find_by_keyword", run_type="tool")
+@tool
 def _find_by_keyword_impl(keyword: str, dataset_path: str = str(DATASET_DEFAULT)) -> str:
     """Return items whose title or tags contain the keyword (case-insensitive)."""
     rows = _load_rows(dataset_path)
@@ -112,11 +112,6 @@ def coherence_check(
         "missing_reverse": missing_reverse,
         "coherence_rate": rate
     }
-
-# Wrap the traced functions as LangChain tools
-mean_price = tool(_mean_price_impl)
-find_by_keyword = tool(_find_by_keyword_impl)
-
 
 
 # This is really great
