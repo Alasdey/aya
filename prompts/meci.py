@@ -1,15 +1,17 @@
-from __future__ import annotations
-from typing import List, Dict, Any
 
-# ---- MECI prompts ----
-def _meci_system_prompt() -> str:
-    base = _system_prompt().strip()
-    addon = (
-        "\n\nYou are an expert MECI annotator. "
-        "Draft labels for each requested pair, then you MUST call the `coherence_check` tool with those draft labels. "
-        "Use the tool's output to fix conflicts and ensure symmetric reverses for causal pairs. "
-    )
-    return base + addon
+from __future__ import annotations
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+import yaml
+
+# Repo root + config (to find prompts/system.txt)
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+
+# ---- Base/system prompt loader ----
+def _system_prompt() -> str:
+    p = ROOT / CONFIG["paths"]["system_prompt"]
+    return p.read_text(encoding="utf-8")
 
 
 def _meci_system_prompt() -> str:
