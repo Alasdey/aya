@@ -18,6 +18,8 @@ from langchain_openai import ChatOpenAI
 
 # Tools
 from tools.tools import TOOLS
+from prompts.meci import _meci_system_prompt, _meci_user_prompt
+from utils.metrics import compute_multiclass_metrics, compute_binary_metrics
 
 # export OPENROUTER_API_KEY="sk-or-..."
 # export LANGSMITH_API_KEY="lsv2_..."        # required for tracing
@@ -97,77 +99,6 @@ def _extract_last_json_array(messages: List[AnyMessage]) -> List[Dict[str, Any]]
     except Exception:
         return []
 
-def compute_multiclass_metrics(y_true: List[str], y_pred: List[str], labels: List[str]):
-    counts = {lab: {"tp": 0, "fp": 0, "fn": 0} for lab in labels}
-    for gt, pr in zip(y_true, y_pred):
-        for lab in labels:
-            if pr == lab and gt == lab:
-                counts[lab]["tp"] += 1
-            elif pr == lab and gt != lab:
-                counts[lab]["fp"] += 1
-            elif pr != lab and gt == lab:
-                counts[lab]["fn"] += 1
-
-    per_label = {}
-    for lab in labels:
-        tp, fp, fn = counts[lab]["tp"], counts[lab]["fp"], counts[lab]["fn"]
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1   = (2*prec*rec)/(prec+rec) if (prec+rec) > 0 else 0.0
-        per_label[lab] = {"precision": prec, "recall": rec, "f1": f1, "support": tp + fn}
-
-    eval_labels = [lab for lab in labels if lab.lower() != "norel"] or labels
-    macro_f1 = sum(per_label[lab]["f1"] for lab in eval_labels) / len(eval_labels)
-
-    total_tp = sum(counts[lab]["tp"] for lab in eval_labels)
-    total_fp = sum(counts[lab]["fp"] for lab in eval_labels)
-    total_fn = sum(counts[lab]["fn"] for lab in eval_labels)
-
-    micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-    micro_recall    = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-    micro_f1 = (2*micro_precision*micro_recall)/(micro_precision+micro_recall) if (micro_precision+micro_recall)>0 else 0.0
-
-    return {"per_label": per_label, "macro_f1": macro_f1,
-            "micro_precision": micro_precision, "micro_recall": micro_recall,
-            "micro_f1": micro_f1, "total": len(y_true)}
-
-def compute_binary_metrics(y_true: List[str], y_pred: List[str]):
-    def binarize(y):
-        return ["POS" if lab in ("CauseEffect","EffectCause") else "NEG" for lab in y]
-    yt, yp = binarize(y_true), binarize(y_pred)
-    tp = sum(1 for a,b in zip(yt,yp) if a=="POS" and b=="POS")
-    fp = sum(1 for a,b in zip(yt,yp) if a=="NEG" and b=="POS")
-    fn = sum(1 for a,b in zip(yt,yp) if a=="POS" and b=="NEG")
-    prec = tp/(tp+fp) if (tp+fp)>0 else 0.0
-    rec  = tp/(tp+fn) if (tp+fn)>0 else 0.0
-    f1   = (2*prec*rec)/(prec+rec) if (prec+rec)>0 else 0.0
-    return {"precision":prec, "recall":rec, "f1":f1, "support_pos": sum(1 for v in yt if v=="POS")}
-
-
-def _meci_system_prompt() -> str:
-    # Base + strict tool use
-    base = _system_prompt().strip()
-    addon = (
-        "\n\nYou are an expert MECI annotator. "
-        "Draft labels for each requested pair, then you should use call the tools"
-        "Use the tool's output to fix conflicts and ensure symmetric reverses for causal pairs. "
-        # "Return ONLY the final JSON array."
-    )
-    return base + addon
-
-def _meci_user_prompt(doc_text: str, batch_pairs: List[tuple[str,str,str]], spans: Dict[str,str]) -> str:
-    pair_lines = []
-    for (Ti, _gold, Tj) in batch_pairs:
-        si = spans.get(Ti, "")
-        sj = spans.get(Tj, "")
-        pair_lines.append(f'- "{Ti},{Tj}" ( {Ti}="{si}" , {Tj}="{sj}" )')
-    return (
-        "Text:\n" + doc_text + "\n\n"
-        "Pairs to classify (use EXACT pair ids and order):\n" + "\n".join(pair_lines) + "\n\n"
-        "Return ONLY a JSON array like:\n[\n  {\"pair\":\"T0,T1\",\"label\":\"CauseEffect\"}\n]\n"
-        "Before answering, you should call the `coherence_check` tool with your draft labels; "
-        "then output the corrected final array only."
-    )
 
 def _pred_map_from_json(arr: List[Dict[str, Any]], requested_pairs: List[tuple[str,str,str]]) -> Dict[tuple[str,str], str]:
     pred_map: Dict[tuple[str,str], str] = {}
