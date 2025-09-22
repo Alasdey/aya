@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import yaml
 from pathlib import Path
 from statistics import mean
 from typing import List, Dict, Any, Tuple, Optional
@@ -387,4 +388,4 @@ def worker(
     return {"stage": "worker", "content": out, "meta": {"model": model or CONFIG.get("model")}}
 
 # Export all tools
-TOOLS = [coherence_check, thinker, critic, summarizer, worker]
+TOOLS = [coherence_check]#, thinker, critic, summarizer, worker]
