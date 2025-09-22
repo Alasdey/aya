@@ -32,8 +32,7 @@ CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 # ---- LangSmith v2 tracing (env) ----
 # Required: LANGSMITH_API_KEY; Recommended: LANGSMITH_PROJECT
 os.environ.setdefault("LANGSMITH_TRACING_V2", "true")  # v2 tracing switch
-if "langsmith_project" in CONFIG:
-    os.environ["LANGSMITH_PROJECT"] = CONFIG["langsmith_project"]
+os.environ["LANGSMITH_PROJECT"] = CONFIG["langsmith_project"]
 # (Optional) if you have multiple workspaces:
 # os.environ["LANGSMITH_WORKSPACE_ID"] = "<workspace-id>"  # 
 
@@ -143,8 +142,6 @@ def compute_binary_metrics(y_true: List[str], y_pred: List[str]):
     rec  = tp/(tp+fn) if (tp+fn)>0 else 0.0
     f1   = (2*prec*rec)/(prec+rec) if (prec+rec)>0 else 0.0
     return {"precision":prec, "recall":rec, "f1":f1, "support_pos": sum(1 for v in yt if v=="POS")}
-
-
 
 
 def _meci_system_prompt() -> str:

@@ -9,30 +9,30 @@ from langchain_core.tools import tool
 from langsmith.run_helpers import traceable  # <- LangSmith tracing
 
 
-DATASET_DEFAULT = Path(__file__).resolve().parents[1] / "data" / "sample.jsonl"
+# DATASET_DEFAULT = Path(__file__).resolve().parents[1] / "data" / "sample.jsonl"
 
 
-def _load_rows(dataset_path: str | Path = DATASET_DEFAULT) -> List[Dict[str, Any]]:
-    p = Path(dataset_path)
-    with p.open("r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f]
+# def _load_rows(dataset_path: str | Path = DATASET_DEFAULT) -> List[Dict[str, Any]]:
+#     p = Path(dataset_path)
+#     with p.open("r", encoding="utf-8") as f:
+#         return [json.loads(line) for line in f]
 
 
-@tool
-def mean_price(dataset_path: str = str(DATASET_DEFAULT)) -> str:
-    """Compute the mean price over all items in the JSONL dataset."""
-    rows = _load_rows(dataset_path)
-    prices = [float(r["price"]) for r in rows if "price" in r]
-    return f"{mean(prices):.2f}"
+# @tool
+# def mean_price(dataset_path: str = str(DATASET_DEFAULT)) -> str:
+#     """Compute the mean price over all items in the JSONL dataset."""
+#     rows = _load_rows(dataset_path)
+#     prices = [float(r["price"]) for r in rows if "price" in r]
+#     return f"{mean(prices):.2f}"
 
 
-@tool
-def find_by_keyword(keyword: str, dataset_path: str = str(DATASET_DEFAULT)) -> str:
-    """Return items whose title or tags contain the keyword (case-insensitive)."""
-    rows = _load_rows(dataset_path)
-    k = keyword.lower().strip()
-    hits = [r for r in rows if k in r.get("title", "").lower() or any(k in t.lower() for t in r.get("tags", []))]
-    return "[]" if not hits else json.dumps(hits, ensure_ascii=False)
+# @tool
+# def find_by_keyword(keyword: str, dataset_path: str = str(DATASET_DEFAULT)) -> str:
+#     """Return items whose title or tags contain the keyword (case-insensitive)."""
+#     rows = _load_rows(dataset_path)
+#     k = keyword.lower().strip()
+#     hits = [r for r in rows if k in r.get("title", "").lower() or any(k in t.lower() for t in r.get("tags", []))]
+#     return "[]" if not hits else json.dumps(hits, ensure_ascii=False)
 
 
 CAUSAL = {"CauseEffect", "EffectCause"}
