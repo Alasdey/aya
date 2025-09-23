@@ -40,6 +40,11 @@ prompts:
         {"pair":"T0,T1","label":"CauseEffect"}
       ]
     addon: |
+      The MECI (Multilingual Event Causality Identification) dataset is designed to annotate causal relations between event triggers in texts across multiple languages, 
+      with a strong emphasis on coherence rules to ensure logical consistency. These rules mandate that causal links—labeled as "CauseEffect" (where one event causes, enables, or prevents another) 
+      or "EffectCause" (reversing the direction)—must form a directed acyclic graph, avoiding cycles and directional asymmetries (e.g., preventing inconsistent reversals like A causes B while B causes A without justification). 
+      Annotations reject mere temporal sequences or correlations, focusing instead on explicit or strongly implicit causal mechanisms, such as enablement or prevention, to maintain a coherent narrative structure within the text's scope. 
+
       ## Label set (exact strings)
       - "CauseEffect": Ti causes/enables/leads to or prevents the absence of Tj (Ti → Tj).
       - "EffectCause": Tj causes/enables/leads to or prevents the absence of Ti (Tj → Ti).
