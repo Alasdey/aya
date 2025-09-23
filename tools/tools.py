@@ -326,5 +326,25 @@ def worker(
     out = _llm_content(llm, _WORKER_SYS, prompt)
     return {"stage": "worker", "content": out, "meta": {"model": model or CONFIG.get("model")}}
 
-# Export all tools (unchanged default)
-TOOLS = [coherence_check]  # , thinker, critic, summarizer, worker
+
+# -------- Tool selection from config (NEW) --------
+
+# Registry of available tool objects by name
+TOOL_REGISTRY: Dict[str, Any] = {
+    "coherence_check": coherence_check,
+    "thinker": thinker,
+    "critic": critic,
+    "summarizer": summarizer,
+    "worker": worker,
+}
+
+# Read enabled tool names from config (default to just coherence_check)
+ENABLED_TOOL_NAMES: List[str] = CONFIG.get("tools", {}).get("enabled", ["coherence_check"])
+
+# Validate configuration early
+_unknown = [name for name in ENABLED_TOOL_NAMES if name not in TOOL_REGISTRY]
+if _unknown:
+    raise ValueError(f"Unknown tools in config.tools.enabled: {', '.join(_unknown)}")
+
+# Export the selected tools in the order specified by config
+TOOLS: List[Any] = [TOOL_REGISTRY[name] for name in ENABLED_TOOL_NAMES]

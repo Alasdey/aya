@@ -13,9 +13,16 @@ thread_id: "demo-thread-001"
 paths:
   dataset_path: "data/sample.jsonl"  # system prompt file no longer used
 
-# -------------------------
-# All prompts live here now
-# -------------------------
+# Tools enabled
+tools:
+  enabled:
+    - coherence_check     # default minimal setup
+    # - thinker
+    # - critic
+    # - summarizer
+    # - worker
+
+# All prompts 
 prompts:
   system:
     base: |
