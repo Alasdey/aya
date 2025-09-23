@@ -5,7 +5,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any, Optional  # <- add these for type hints
 
 import yaml
 from langsmith.run_helpers import tracing_context  # <- LangSmith top-level run context
@@ -21,24 +21,12 @@ from tools.tools import TOOLS
 from prompts.meci import _meci_system_prompt, _meci_user_prompt
 from utils.metrics import compute_multiclass_metrics, compute_binary_metrics
 
-# export OPENROUTER_API_KEY="sk-or-..."
-# export LANGSMITH_API_KEY="lsv2_..."        # required for tracing
-# export LANGSMITH_TRACING_V2=true           # turn on v2 tracing
-# export LANGSMITH_PROJECT="openrouter-langgraph-demo-4324"
-# export LANGSMITH_WORKSPACE_ID="..."      # if you need to target a specific workspace
-
 ROOT = Path(__file__).resolve().parent
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 
-
 # ---- LangSmith v2 tracing (env) ----
-# Required: LANGSMITH_API_KEY; Recommended: LANGSMITH_PROJECT
-os.environ.setdefault("LANGSMITH_TRACING_V2", "true")  # v2 tracing switch
+os.environ.setdefault("LANGSMITH_TRACING_V2", "true")
 os.environ["LANGSMITH_PROJECT"] = CONFIG["langsmith_project"]
-# (Optional) if you have multiple workspaces:
-# os.environ["LANGSMITH_WORKSPACE_ID"] = "<workspace-id>"  # 
-
-
 
 # NEW imports
 import re
@@ -48,7 +36,6 @@ from collections import defaultdict
 PAIR_LABELS = {"CauseEffect", "EffectCause", "NoRel"}
 TAG_RE = re.compile(r"<T(\d+)\s+([^>]+)>")
 
-# E.g. "<T1 destroyed> CauseEffect <T0 suspended>"
 ANN_PAIR_RE = re.compile(
     r"<T(\d+)\s+[^>]+>\s+(CauseEffect|EffectCause|NoRel)\s+<T(\d+)\s+[^>]+>",
     re.IGNORECASE
@@ -76,16 +63,12 @@ def chunked(lst, n):
         yield lst[i:i+n]
 
 def _extract_last_json_array(messages: List[AnyMessage]) -> List[Dict[str, Any]]:
-    """
-    Return the last AI message that contains a JSON array. Robust to code fences.
-    """
     arr_text = None
     for m in reversed(messages):
         if isinstance(m, AIMessage):
             raw = (m.content or "").strip()
             if raw.startswith("```"):
                 parts = raw.split("```")
-                # pick the JSON-ish section
                 raw = next((p for p in parts if "[" in p and "]" in p), raw)
             l = raw.find("[")
             r = raw.rfind("]")
@@ -99,7 +82,6 @@ def _extract_last_json_array(messages: List[AnyMessage]) -> List[Dict[str, Any]]
     except Exception:
         return []
 
-
 def _pred_map_from_json(arr: List[Dict[str, Any]], requested_pairs: List[tuple[str,str,str]]) -> Dict[tuple[str,str], str]:
     pred_map: Dict[tuple[str,str], str] = {}
     for obj in arr or []:
@@ -109,7 +91,6 @@ def _pred_map_from_json(arr: List[Dict[str, Any]], requested_pairs: List[tuple[s
         if lab in PAIR_LABELS and "," in p:
             a,b = [t.strip() for t in p.split(",",1)]
             pred_map[(a,b)] = lab
-    # ensure all requested keys exist (default NoRel if absent)
     for (Ti, _gold, Tj) in requested_pairs:
         pred_map.setdefault((Ti,Tj), "NoRel")
     return pred_map
@@ -124,20 +105,8 @@ def predict_meci_hf(
     streaming: bool = False,
     ls_project: Optional[str] = None,
 ):
-    """
-    Predict labels with tool-enforced coherence:
-      1) Model drafts labels for a batch of pairs within a doc.
-      2) Model MUST call `coherence_check` tool with those drafts.
-      3) Model returns corrected final JSON array.
-    Then compute metrics vs gold.
-    """
-    
-    if ls_project:
-        os.environ["LANGSMITH_PROJECT"] = ls_project
-
     from datasets import load_dataset
     ds = load_dataset(repo_id, split=split, streaming=streaming)
-    # normalize iteration
     it = ds if streaming else [ds[i] for i in range(len(ds))]
 
     labels_all_true: List[str] = []
@@ -167,7 +136,6 @@ def predict_meci_hf(
                 with tracing_context(name="doc_predict", metadata={"doc_idx": idx, "num_pairs": len(batch)}, tags=["meci","doc","predict"]):
                     final = graph.invoke({"messages": [sys_msg, user_msg]}, config=cfg)
 
-                # The final AI message should be an array; parse it
                 arr = _extract_last_json_array(final["messages"])
                 pred_map = _pred_map_from_json(arr, batch)
 
@@ -175,7 +143,6 @@ def predict_meci_hf(
                     labels_all_true.append(gold_label)
                     labels_all_pred.append(pred_map.get((Ti,Tj), "NoRel"))
 
-    # Metrics
     labels = ["CauseEffect","EffectCause","NoRel"]
     mc = compute_multiclass_metrics(labels_all_true, labels_all_pred, labels)
     binm = compute_binary_metrics(labels_all_true, labels_all_pred)
@@ -192,20 +159,16 @@ def predict_meci_hf(
     }
     return report
 
-
-
 # ---- Model via OpenRouter (OpenAI-compatible) ----
 llm = ChatOpenAI(
     model=CONFIG["model"],
     temperature=CONFIG.get("temperature", 0),
     api_key=os.environ.get("OPENROUTER_API_KEY"),
-    base_url=CONFIG.get("openrouter_base_url", "https://openrouter.ai/api/v1"),  # 
+    base_url=CONFIG.get("openrouter_base_url", "https://openrouter.ai/api/v1"),
 )
 
-# Advertise tools to the model; (optional) name the run for clarity in LangSmith UI
 llm_with_tools = llm.bind_tools(TOOLS).with_config({"run_name": "chat_model+tools"})
 
-# ---- Graph: model ↔ tools loop ----
 def should_continue(state: MessagesState) -> str:
     last = state["messages"][-1]
     return "tools" if getattr(last, "tool_calls", None) else END
@@ -215,20 +178,23 @@ def call_model(state: MessagesState, *, config=None):
     ai = llm_with_tools.invoke(messages, config=config)
     return {"messages": [ai]}
 
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import InMemorySaver
+
 builder = StateGraph(MessagesState)
 builder.add_node("call_model", call_model)
-builder.add_node("tools", ToolNode(TOOLS).with_config({"run_name": "tool_node"}))  # tools traced individually
+builder.add_node("tools", ToolNode(TOOLS).with_config({"run_name": "tool_node"}))
 builder.add_edge(START, "call_model")
 builder.add_conditional_edges("call_model", should_continue, ["tools", END])
 builder.add_edge("tools", "call_model")
 
-checkpointer = InMemorySaver()  # preserves threaded history and tool messages 
+checkpointer = InMemorySaver()
 graph = builder.compile(checkpointer=checkpointer)
 
-# ---- Demo run ----
+# ---- Demo helper (now returns config-based system prompt) ----
 def _system_prompt() -> str:
-    p = ROOT / CONFIG["paths"]["system_prompt"]
-    return p.read_text(encoding="utf-8")
+    return CONFIG["prompts"]["system"]["base"]
 
 def _sample_prompt() -> str:
     return "Use the coherence check tool with a made up sample to test it"
@@ -258,19 +224,3 @@ if __name__ == "__main__":
     )
     print(json.dumps(res, ensure_ascii=False, indent=2))
     sys.exit(0)
-
-
-  
-    # system = SystemMessage(_system_prompt())
-    # user = HumanMessage(_sample_prompt())
-    # thread_id = CONFIG.get("thread_id", "demo-thread-001")
-    # cfg = {"configurable": {"thread_id": thread_id}, "tags": ["demo", "langgraph", "openrouter"]}
-
-    # # Top-level LangSmith run (adds clear name/metadata in the UI)
-    # with tracing_context(name="agent_run", metadata={"thread_id": thread_id}, tags=["agent", "tools"]):
-    #     final = graph.invoke({"messages": [system, user]}, config=cfg)
-    #     print("\nAssistant:", final["messages"][-1].content)
-
-    #     followup = HumanMessage("Great. Now show only titles for the blue items.")
-    #     final2 = graph.invoke({"messages": [followup]}, config=cfg)
-    #     print("\nAssistant (follow-up):", final2["messages"][-1].content)

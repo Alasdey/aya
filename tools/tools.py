@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import yaml
 from pathlib import Path
@@ -9,32 +10,9 @@ from typing import List, Dict, Any, Tuple, Optional
 from langchain_core.tools import tool
 from langsmith.run_helpers import traceable  # <- LangSmith tracing
 
-
-# DATASET_DEFAULT = Path(__file__).resolve().parents[1] / "data" / "sample.jsonl"
-
-
-# def _load_rows(dataset_path: str | Path = DATASET_DEFAULT) -> List[Dict[str, Any]]:
-#     p = Path(dataset_path)
-#     with p.open("r", encoding="utf-8") as f:
-#         return [json.loads(line) for line in f]
-
-
-# @tool
-# def mean_price(dataset_path: str = str(DATASET_DEFAULT)) -> str:
-#     """Compute the mean price over all items in the JSONL dataset."""
-#     rows = _load_rows(dataset_path)
-#     prices = [float(r["price"]) for r in rows if "price" in r]
-#     return f"{mean(prices):.2f}"
-
-
-# @tool
-# def find_by_keyword(keyword: str, dataset_path: str = str(DATASET_DEFAULT)) -> str:
-#     """Return items whose title or tags contain the keyword (case-insensitive)."""
-#     rows = _load_rows(dataset_path)
-#     k = keyword.lower().strip()
-#     hits = [r for r in rows if k in r.get("title", "").lower() or any(k in t.lower() for t in r.get("tags", []))]
-#     return "[]" if not hits else json.dumps(hits, ensure_ascii=False)
-
+# New imports needed for role tools
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
 CAUSAL = {"CauseEffect", "EffectCause"}
 
@@ -87,10 +65,8 @@ def coherence_check(
             return "EffectCause"
         if m in ("norel", "no-rel", "no_relation", "no-relation", "none"):
             return "NoRel"
-        # Fall back to original; if it's not one of the three, we drop it later.
         return lab.strip()
 
-    # Build a directed map from the provided (possibly partial) predictions.
     dir_map: Dict[Tuple[str, str], str] = {}
     for obj in pairs or []:
         p = (obj.get("pair") or "").strip()
@@ -100,10 +76,8 @@ def coherence_check(
         a, b = [t.strip() for t in p.split(",", 1)]
         if not a or not b:
             continue
-        # last-one-wins if duplicates; that’s fine for a tool check
         dir_map[(a, b)] = lab
 
-    # Unordered set of entity pairs inferred *only* from what we were given
     unordered = set()
     for (a, b) in dir_map:
         if a != b:
@@ -114,16 +88,14 @@ def coherence_check(
     conflicts: List[Dict[str, str]] = []
     missing_reverse: List[Dict[str, str]] = []
 
-    # New helper outputs to make auto-fixing easy
-    suggested_additions: List[Dict[str, str]] = []  # {"pair":"Tj,Ti","label":"..."}
-    suggested_updates: List[Dict[str, str]] = []    # {"pair":"Tj,Ti","from":"...","to":"..."}
-    assumed_norel: List[List[str]] = []             # [ [Ti, Tj], ... ]  (means "Tj,Ti" assumed NoRel)
+    suggested_additions: List[Dict[str, str]] = []
+    suggested_updates: List[Dict[str, str]] = []
+    assumed_norel: List[List[str]] = []
 
     for (x, y) in unordered:
         lab_xy = dir_map.get((x, y))
         lab_yx = dir_map.get((y, x))
 
-        # If neither direction is causal, we do not include it in "considered"
         cx = lab_xy in CAUSAL if lab_xy else False
         cy = lab_yx in CAUSAL if lab_yx else False
 
@@ -131,12 +103,9 @@ def coherence_check(
             considered += 1
 
             if lab_xy and lab_yx:
-                # Both directions present
                 if (lab_xy, lab_yx) in (("CauseEffect", "EffectCause"), ("EffectCause", "CauseEffect")):
                     symmetric_ok.append([x, y])
                 else:
-                    # Incoherent: suggest making (y,x) the inverse of (x,y) when (x,y) is causal,
-                    # otherwise invert the other direction.
                     if lab_xy in CAUSAL:
                         suggest_to = _inverse_label(lab_xy)
                         conflicts.append({
@@ -154,7 +123,6 @@ def coherence_check(
                             "pair": f"{x},{y}", "from": lab_xy, "to": suggest_to
                         })
             else:
-                # Exactly one causal direction present -> missing reverse
                 if lab_xy in CAUSAL and lab_yx is None:
                     inv = _inverse_label(lab_xy)
                     missing_reverse.append({"a": x, "b": y, "lab_ab": lab_xy, "suggest_ba": inv})
@@ -164,14 +132,11 @@ def coherence_check(
                     missing_reverse.append({"a": y, "b": x, "lab_ab": lab_yx, "suggest_ba": inv})
                     suggested_additions.append({"pair": f"{x},{y}", "label": inv})
         else:
-            # No causal labels in either direction.
-            # If exactly one side is explicitly NoRel and the reverse is missing,
-            # treat the missing reverse as NoRel (do not flag it).
             if lab_xy == "NoRel" and lab_yx is None:
-                assumed_norel.append([y, x])  # meaning "(y,x) assumed NoRel"
+                assumed_norel.append([y, x])
                 suggested_additions.append({"pair": f"{y},{x}", "label": "NoRel"})
             if lab_yx == "NoRel" and lab_xy is None:
-                assumed_norel.append([x, y])  # meaning "(x,y) assumed NoRel"
+                assumed_norel.append([x, y])
                 suggested_additions.append({"pair": f"{x},{y}", "label": "NoRel"})
 
     rate = (len(symmetric_ok) / considered) if considered else 0.0
@@ -182,13 +147,12 @@ def coherence_check(
         "conflicts": conflicts,
         "missing_reverse": missing_reverse,
         "coherence_rate": rate,
-        # helpful extras (won't break existing callers)
         "suggested_additions": suggested_additions,
         "suggested_updates": suggested_updates,
         "assumed_norel": assumed_norel,
     }
 
-# Multi agents tools
+# -------- Role tools now pull prompts from config --------
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
@@ -206,10 +170,6 @@ def _llm_content(llm: ChatOpenAI, system: str, prompt: str) -> str:
     return (resp.content or "").strip()
 
 def _format_artifacts(prior_artifacts: Optional[List[Dict[str, Any]]]) -> str:
-    """
-    Compact, role-tagged context to pass between tools.
-    Expect items like {"stage": "thinker|critic|summarizer|worker", "content": "..."}.
-    """
     if not prior_artifacts:
         return "[none]"
     lines = []
@@ -229,32 +189,11 @@ def _last_of(prior_artifacts: Optional[List[Dict[str, Any]]], stage: str) -> Opt
             return str(art["content"])
     return None
 
-# ---- System prompts for each role ----
-
-_THINKER_SYS = (
-    "You are Thinker. Do deep, structured reasoning.\n"
-    "Produce a concise plan with numbered steps, explicit assumptions, edge cases, and data to verify.\n"
-    "Do NOT write the final deliverable."
-)
-
-_CRITIC_SYS = (
-    "You are Critic. Be constructive and precise.\n"
-    "List concrete issues, missing information, incoherences, and constraints.\n"
-    "Provide actionable fixes as bullet points; do NOT rewrite the whole prediction."
-)
-
-_SUMMARIZER_SYS = (
-    "You are Summarizer. Write a crisp summary for a busy reader. Keep the <> tags\n"
-    "Keep it faithful and concrete, outlining the causal relations between mentions"
-)
-
-_WORKER_SYS = (
-    "You are Worker. Produce the final deliverable for the user task.\n"
-    "Follow any plans and honor constraints from prior artifacts.\n"
-    "Return a JSON array like:\n[\n  {\"pair\":\"T0,T1\",\"label\":\"CauseEffect\"}\n]\n"
-)
-
-# ---- Tools ----
+# System prompts pulled from config
+_THINKER_SYS = CONFIG["prompts"]["roles"]["thinker"].strip()
+_CRITIC_SYS = CONFIG["prompts"]["roles"]["critic"].strip()
+_SUMMARIZER_SYS = CONFIG["prompts"]["roles"]["summarizer"].strip()
+_WORKER_SYS = CONFIG["prompts"]["roles"]["worker"].strip()
 
 @tool
 def thinker(
@@ -387,5 +326,5 @@ def worker(
     out = _llm_content(llm, _WORKER_SYS, prompt)
     return {"stage": "worker", "content": out, "meta": {"model": model or CONFIG.get("model")}}
 
-# Export all tools
-TOOLS = [coherence_check]#, thinker, critic, summarizer, worker]
+# Export all tools (unchanged default)
+TOOLS = [coherence_check]  # , thinker, critic, summarizer, worker
