@@ -137,7 +137,14 @@ def predict_meci_hf(
                 cfg = {"configurable": {"thread_id": thread_id}, "tags": ["meci","predict", split]}
 
                 with tracing_context(name="doc_predict", metadata={"doc_idx": idx, "num_pairs": len(batch)}, tags=["meci","doc","predict"]):
-                    final = graph.invoke({"messages": [sys_msg, user_msg]}, config=cfg)
+                    try:
+                        final = graph.invoke({"messages": [sys_msg, user_msg]}, config=cfg)
+                        arr = _extract_last_json_array(final["messages"])
+                    except Exception as e:
+                        # Keep going: treat as if the model returned no predictions for this batch.
+                        # (pred_map below will default all requested pairs to "NoRel".)
+                        print(f"[WARN] tool/model error at doc {idx}: {e}", file=sys.stderr)
+                        arr = []
 
                 arr = _extract_last_json_array(final["messages"])
                 pred_map = _pred_map_from_json(arr, batch)
