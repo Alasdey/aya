@@ -16,6 +16,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AnyMessage
 from langchain_openai import ChatOpenAI
 
+import asyncio
+import uuid
+
 # Tools
 from tools.tools import TOOLS
 from prompts.meci import _meci_system_prompt, _meci_user_prompt
@@ -108,6 +111,38 @@ def predict_meci_hf(
     streaming: bool = False,
     ls_project: Optional[str] = None,
 ):
+    """
+    Backwards-compatible wrapper that runs the new async implementation.
+    """
+    return asyncio.run(
+        predict_meci_hf_async(
+            repo_id=repo_id,
+            split=split,
+            text_field=text_field,
+            ann_field=ann_field,
+            max_examples=max_examples,
+            pair_batch_size=pair_batch_size,
+            streaming=streaming,
+            ls_project=ls_project,
+        )
+    )
+
+
+async def predict_meci_hf_async(
+    repo_id: str,
+    split: str = "test",
+    text_field: str = "text",
+    ann_field: str = "annotations",
+    max_examples: int = 0,
+    pair_batch_size: int = 100,
+    streaming: bool = False,
+    ls_project: Optional[str] = None,
+    max_concurrency: int = 8,
+):
+    """
+    Async version: schedules **each batch** for a document as a separate task and runs them concurrently.
+    Uses graph.ainvoke under the hood.
+    """
     from datasets import load_dataset
     ds = load_dataset(repo_id, split=split, streaming=streaming)
     it = ds if streaming else [ds[i] for i in range(len(ds))]
@@ -116,44 +151,58 @@ def predict_meci_hf(
     labels_all_pred: List[str] = []
     skipped = 0
 
-    with tracing_context(name="meci_predict_hf", metadata={"repo_id": repo_id, "split": split}, tags=["eval","meci","predict"]):
+    sem = asyncio.Semaphore(max_concurrency)
+    tasks: List[asyncio.Task] = []
+
+    async def run_batch(doc_idx: int, batch_idx: int, doc_text: str,
+                        spans: Dict[str, str], batch: List[tuple[str, str, str]]):
+        async with sem:
+            sys_msg = SystemMessage(_meci_system_prompt())
+            user_msg = HumanMessage(_meci_user_prompt(doc_text, batch, spans))
+
+            # IMPORTANT: unique thread_id per task to avoid checkpointer clashes
+            thread_id = f"meci::predict::{split}::{doc_idx}::b{batch_idx}::{uuid.uuid4().hex[:8]}"
+            cfg = {"configurable": {"thread_id": thread_id}, "tags": ["meci", "predict", split]}
+
+            with tracing_context(
+                name="doc_predict_async",
+                metadata={"doc_idx": doc_idx, "batch_idx": batch_idx, "num_pairs": len(batch)},
+                tags=["meci", "doc", "predict", "async"],
+            ):
+                try:
+                    final = await graph.ainvoke({"messages": [sys_msg, user_msg]}, config=cfg)
+                    arr = _extract_last_json_array(final["messages"])
+                except Exception as e:
+                    print(f"[WARN] async tool/model error at doc {doc_idx} batch {batch_idx}: {e}", file=sys.stderr)
+                    arr = []
+
+            pred_map = _pred_map_from_json(arr, batch)
+            y_true = [gold for (_Ti, gold, _Tj) in batch]
+            y_pred = [pred_map.get((Ti, Tj), "NoRel") for (Ti, _gold, Tj) in batch]
+            return y_true, y_pred
+
+    with tracing_context(name="meci_predict_hf_async", metadata={"repo_id": repo_id, "split": split}, tags=["eval","meci","predict","async"]):
         for idx, row in enumerate(it):
             if max_examples and idx >= max_examples:
                 break
             doc_text = row.get(text_field, "")
             ann_text = row.get(ann_field, "")
-
             gold_triples = parse_annotations(ann_text)
             if not gold_triples:
                 skipped += 1
                 continue
             spans = extract_event_spans(doc_text)
 
-            for batch in chunked(gold_triples, pair_batch_size):
-                sys_msg = SystemMessage(_meci_system_prompt())
-                user_msg = HumanMessage(_meci_user_prompt(doc_text, batch, spans))
+            for b_idx, batch in enumerate(chunked(gold_triples, pair_batch_size)):
+                tasks.append(asyncio.create_task(run_batch(idx, b_idx, doc_text, spans, batch)))
 
-                thread_id = f"meci::predict::{split}::{idx}"
-                cfg = {"configurable": {"thread_id": thread_id}, "tags": ["meci","predict", split]}
+        # Gather results as they complete
+        for coro in asyncio.as_completed(tasks):
+            y_true, y_pred = await coro
+            labels_all_true.extend(y_true)
+            labels_all_pred.extend(y_pred)
 
-                with tracing_context(name="doc_predict", metadata={"doc_idx": idx, "num_pairs": len(batch)}, tags=["meci","doc","predict"]):
-                    try:
-                        final = graph.invoke({"messages": [sys_msg, user_msg]}, config=cfg)
-                        arr = _extract_last_json_array(final["messages"])
-                    except Exception as e:
-                        # Keep going: treat as if the model returned no predictions for this batch.
-                        # (pred_map below will default all requested pairs to "NoRel".)
-                        print(f"[WARN] tool/model error at doc {idx}: {e}", file=sys.stderr)
-                        arr = []
-
-                arr = _extract_last_json_array(final["messages"])
-                pred_map = _pred_map_from_json(arr, batch)
-
-                for (Ti, gold_label, Tj) in batch:
-                    labels_all_true.append(gold_label)
-                    labels_all_pred.append(pred_map.get((Ti,Tj), "NoRel"))
-
-    labels = ["CauseEffect","EffectCause","NoRel"]
+    labels = ["CauseEffect", "EffectCause", "NoRel"]
     mc = compute_multiclass_metrics(labels_all_true, labels_all_pred, labels)
     binm = compute_binary_metrics(labels_all_true, labels_all_pred)
 
@@ -215,19 +264,23 @@ if __name__ == "__main__":
     parser.add_argument("--pair_batch_size", type=int, default=100)
     parser.add_argument("--max_examples", type=int, default=0, help="0 = all")
     parser.add_argument("--streaming", type=bool, default=False, help="Streaming")
-    parser.add_argument("--ls_project", type=str, required=False, help="Langsmith project name") 
+    parser.add_argument("--ls_project", type=str, required=False, help="Langsmith project name")
+    parser.add_argument("--concurrency", type=int, default=8, help="Max concurrent batch calls") 
 
     args = parser.parse_args()
 
-    res = predict_meci_hf(
-        repo_id=args.repo,
-        split=args.split,
-        text_field=args.text_field,
-        ann_field=args.ann_field,
-        max_examples=args.max_examples,
-        pair_batch_size=args.pair_batch_size,
-        streaming=args.streaming,
-        ls_project=args.ls_project,
+    res = asyncio.run(
+        predict_meci_hf_async(
+            repo_id=args.repo,
+            split=args.split,
+            text_field=args.text_field,
+            ann_field=args.ann_field,
+            max_examples=args.max_examples,
+            pair_batch_size=args.pair_batch_size,
+            streaming=args.streaming,
+            ls_project=args.ls_project,
+            max_concurrency=args.concurrency,
+        )
     )
     print(json.dumps(res, ensure_ascii=False, indent=2))
     sys.exit(0)
