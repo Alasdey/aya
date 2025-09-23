@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional  # <- add these for type hints
 
+from datasets import load_dataset
 import yaml
 from langsmith.run_helpers import tracing_context  # <- LangSmith top-level run context
 
@@ -117,7 +118,6 @@ async def predict_meci_hf_async(
     Async version: schedules **each batch** for a document as a separate task and runs them concurrently.
     Uses graph.ainvoke under the hood.
     """
-    from datasets import load_dataset
     ds = load_dataset(repo_id, split=split, streaming=streaming)
     it = ds if streaming else [ds[i] for i in range(len(ds))]
 
@@ -127,6 +127,7 @@ async def predict_meci_hf_async(
 
     sem = asyncio.Semaphore(max_concurrency)
     tasks: List[asyncio.Task] = []
+    per_doc: Dict[int, Dict[str, List[str]]] = {}  # {doc_idx: {"y_true": [...], "y_pred": [...]}}
 
     async def run_batch(doc_idx: int, batch_idx: int, doc_text: str,
                         spans: Dict[str, str], batch: List[tuple[str, str, str]]):
@@ -153,7 +154,8 @@ async def predict_meci_hf_async(
             pred_map = _pred_map_from_json(arr, batch)
             y_true = [gold for (_Ti, gold, _Tj) in batch]
             y_pred = [pred_map.get((Ti, Tj), "NoRel") for (Ti, _gold, Tj) in batch]
-            return y_true, y_pred
+            # include doc_idx so caller can bucket by document
+            return doc_idx, y_true, y_pred
 
     with tracing_context(name="meci_predict_hf_async", metadata={"repo_id": repo_id, "split": split}, tags=["eval","meci","predict","async"]):
         for idx, row in enumerate(it):
@@ -172,13 +174,43 @@ async def predict_meci_hf_async(
 
         # Gather results as they complete
         for coro in asyncio.as_completed(tasks):
-            y_true, y_pred = await coro
+            doc_idx, y_true, y_pred = await coro
             labels_all_true.extend(y_true)
             labels_all_pred.extend(y_pred)
+            d = per_doc.setdefault(doc_idx, {"y_true": [], "y_pred": []})
+            d["y_true"].extend(y_true)
+            d["y_pred"].extend(y_pred)
 
     labels = ["CauseEffect", "EffectCause", "NoRel"]
     mc = compute_multiclass_metrics(labels_all_true, labels_all_pred, labels)
     binm = compute_binary_metrics(labels_all_true, labels_all_pred)
+
+
+    # ---- Per-document metrics (compute + log into trace metadata) ----
+    per_doc_metrics: List[Dict[str, Any]] = []
+    for doc_idx, d in sorted(per_doc.items(), key=lambda x: x[0]):
+        yt, yp = d["y_true"], d["y_pred"]
+        mc_d = compute_multiclass_metrics(yt, yp, labels)
+        binm_d = compute_binary_metrics(yt, yp)
+        doc_report = {
+            "doc_idx": doc_idx,
+            "pairs": len(yt),
+            "macro_f1": mc_d["macro_f1"],
+            "micro_precision": mc_d["micro_precision"],
+            "micro_recall": mc_d["micro_recall"],
+            "micro_f1": mc_d["micro_f1"],
+            "per_label": mc_d["per_label"],
+            "binary": binm_d,
+        }
+        per_doc_metrics.append(doc_report)
+        # Emit a child trace with metrics in metadata so it’s easily inspectable in LangSmith UI
+        with tracing_context(
+            name="doc_metrics",
+            metadata=doc_report,
+            tags=["meci", "doc", "metrics", split],
+        ):
+            # no-op body; metadata is what we want on the trace
+            pass
 
     report = {
         "per_label": mc["per_label"],
@@ -189,6 +221,7 @@ async def predict_meci_hf_async(
         "total_pairs": mc["total"],
         "binary": binm,
         "skipped_docs": skipped,
+        # "per_doc_metrics": per_doc_metrics,
     }
     return report
 

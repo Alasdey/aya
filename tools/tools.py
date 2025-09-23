@@ -23,7 +23,6 @@ def _inverse_label(lab: str) -> str:
 def coherence_check(
     *,
     pairs: List[Dict[str, str]],
-    conversation: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Check directional coherence among the *predicted* pairs only.
@@ -35,7 +34,6 @@ def coherence_check(
 
     Args:
         pairs: [{"pair":"Ti,Tj","label":"CauseEffect|EffectCause|NoRel"}, ...]
-        conversation: optional, ignored except for tracing context.
 
     Returns:
         {
