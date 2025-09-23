@@ -101,32 +101,6 @@ def _pred_map_from_json(arr: List[Dict[str, Any]], requested_pairs: List[tuple[s
         pred_map.setdefault((Ti,Tj), "NoRel")
     return pred_map
 
-def predict_meci_hf(
-    repo_id: str,
-    split: str = "test",
-    text_field: str = "text",
-    ann_field: str = "annotations",
-    max_examples: int = 0,
-    pair_batch_size: int = 100,
-    streaming: bool = False,
-    ls_project: Optional[str] = None,
-):
-    """
-    Backwards-compatible wrapper that runs the new async implementation.
-    """
-    return asyncio.run(
-        predict_meci_hf_async(
-            repo_id=repo_id,
-            split=split,
-            text_field=text_field,
-            ann_field=ann_field,
-            max_examples=max_examples,
-            pair_batch_size=pair_batch_size,
-            streaming=streaming,
-            ls_project=ls_project,
-        )
-    )
-
 
 async def predict_meci_hf_async(
     repo_id: str,

@@ -1,0 +1,74 @@
+*** a/main.py
+--- b/main.py
+@@
+ async def predict_meci_hf_async(
+@@
+-    labels_all_true: List[str] = []
+-    labels_all_pred: List[str] = []
++    labels_all_true: List[str] = []
++    labels_all_pred: List[str] = []
+     skipped = 0
+ 
+     sem = asyncio.Semaphore(max_concurrency)
+     tasks: List[asyncio.Task] = []
++    # --- per-document accumulators ---
++    per_doc: Dict[int, Dict[str, Any]] = {}
+ 
+@@
+     async def run_batch(doc_idx: int, batch_idx: int, doc_text: str,
+                         spans: Dict[str, str], batch: List[tuple[str, str, str]]):
+         async with sem:
+             sys_msg = SystemMessage(_meci_system_prompt())
+             user_msg = HumanMessage(_meci_user_prompt(doc_text, batch, spans))
+@@
+             pred_map = _pred_map_from_json(arr, batch)
+             y_true = [gold for (_Ti, gold, _Tj) in batch]
+             y_pred = [pred_map.get((Ti, Tj), "NoRel") for (Ti, _gold, Tj) in batch]
+-            return y_true, y_pred
++            # return doc index + results (no batch-level logging)
++            return doc_idx, y_true, y_pred
+ 
+     with tracing_context(name="meci_predict_hf_async", metadata={"repo_id": repo_id, "split": split}, tags=["eval","meci","predict","async"]):
+         for idx, row in enumerate(it):
+             if max_examples and idx >= max_examples:
+                 break
+@@
+             spans = extract_event_spans(doc_text)
+ 
+             for b_idx, batch in enumerate(chunked(gold_triples, pair_batch_size)):
+-                tasks.append(asyncio.create_task(run_batch(idx, b_idx, doc_text, spans, batch)))
++                tasks.append(asyncio.create_task(run_batch(idx, b_idx, doc_text, spans, batch)))
++            # initialize per-doc bucket once
++            if idx not in per_doc:
++                per_doc[idx] = {"y_true": [], "y_pred": [], "num_pairs": 0}
+ 
+         # Gather results as they complete
+         for coro in asyncio.as_completed(tasks):
+-            y_true, y_pred = await coro
++            doc_idx, y_true, y_pred = await coro
+             labels_all_true.extend(y_true)
+             labels_all_pred.extend(y_pred)
++            per_doc[doc_idx]["y_true"].extend(y_true)
++            per_doc[doc_idx]["y_pred"].extend(y_pred)
++            per_doc[doc_idx]["num_pairs"] += len(y_true)
+ 
++    # ---- emit one child trace per document with just metrics ----
++    for doc_idx, bucket in per_doc.items():
++        labels = ["CauseEffect", "EffectCause", "NoRel"]
++        mc_doc = compute_multiclass_metrics(bucket["y_true"], bucket["y_pred"], labels)
++        bin_doc = compute_binary_metrics(bucket["y_true"], bucket["y_pred"])
++        with tracing_context(
++            name="doc_metrics",
++            metadata={
++                "doc_idx": doc_idx,
++                "num_pairs": bucket["num_pairs"],
++                "multiclass": mc_doc,
++                "binary": bin_doc,
++            },
++            tags=["meci","metrics","document"],
++        ):
++            pass
++
+     labels = ["CauseEffect", "EffectCause", "NoRel"]
+     mc = compute_multiclass_metrics(labels_all_true, labels_all_pred, labels)
+     binm = compute_binary_metrics(labels_all_true, labels_all_pred)
