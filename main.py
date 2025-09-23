@@ -25,12 +25,15 @@ ROOT = Path(__file__).resolve().parent
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 
 # ---- LangSmith v2 tracing (env) ----
-os.environ.setdefault("LANGSMITH_TRACING_V2", "true")
+os.environ.setdefault("LANGSMITH_TRACING", "true")
 os.environ["LANGSMITH_PROJECT"] = CONFIG["langsmith_project"]
+
+if not os.environ.get("OPENROUTER_API_KEY"):
+    raise RuntimeError("OPENROUTER_API_KEY not set. See https://openrouter.ai/docs/quickstart")
+
 
 # NEW imports
 import re
-from collections import defaultdict
 
 # ---- MECI parsing helpers (inline span format) ----
 PAIR_LABELS = {"CauseEffect", "EffectCause", "NoRel"}
@@ -178,9 +181,6 @@ def call_model(state: MessagesState, *, config=None):
     ai = llm_with_tools.invoke(messages, config=config)
     return {"messages": [ai]}
 
-from langgraph.graph import StateGraph, START, END, MessagesState
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import InMemorySaver
 
 builder = StateGraph(MessagesState)
 builder.add_node("call_model", call_model)
