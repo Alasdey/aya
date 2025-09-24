@@ -24,6 +24,7 @@ import uuid
 from tools.tools import TOOLS
 from prompts.meci import _meci_system_prompt, _meci_user_prompt
 from utils.metrics import compute_multiclass_metrics, compute_binary_metrics
+from utils.run_logger import capture_git_state, log_run
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
@@ -227,7 +228,7 @@ async def predict_meci_hf_async(
         "total_pairs": mc["total"],
         "binary": binm,
         "skipped_docs": skipped,
-        # "per_doc_metrics": per_doc_metrics,
+        "per_doc_metrics": per_doc_metrics,
     }
     return report
 
@@ -279,8 +280,11 @@ if __name__ == "__main__":
     parser.add_argument("--streaming", type=bool, default=False, help="Streaming")
     parser.add_argument("--ls_project", type=str, required=False, help="Langsmith project name")
     parser.add_argument("--concurrency", type=int, default=8, help="Max concurrent batch calls") 
+    parser.add_argument("--logdir", type=str, default="logs", help="Directory to write execution logs")
 
     args = parser.parse_args()
+
+    git = capture_git_state(ROOT)
 
     res = asyncio.run(
         predict_meci_hf_async(
@@ -295,5 +299,16 @@ if __name__ == "__main__":
             max_concurrency=args.concurrency,
         )
     )
+
+    # Logging
+    artifacts = log_run(
+        logdir=Path(args.logdir),
+        config=CONFIG,
+        args=vars(args),
+        results=res,
+        git_state=git,
+    )
+
+    res.pop("per_doc_metrics")
     print(json.dumps(res, ensure_ascii=False, indent=2))
     sys.exit(0)

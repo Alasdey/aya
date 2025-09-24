@@ -63,6 +63,7 @@ prompts:
       4) Keep scope within the provided text window.
 
       You MUST call the counterfactual pair only on  pairs that are uncertain
+      You MUST call the counterfacutal pair at least once
 
     user_template: |
       Text:
