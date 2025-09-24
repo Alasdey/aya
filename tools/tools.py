@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import yaml
+import re
 from pathlib import Path
 from statistics import mean
 from typing import List, Dict, Any, Tuple, Optional
@@ -149,6 +150,138 @@ def coherence_check(
         "suggested_updates": suggested_updates,
         "assumed_norel": assumed_norel,
     }
+
+def _norm_pair_str(s: str) -> tuple[str, str]:
+    if not s or "," not in s:
+        raise ValueError("pair must be like 'Ti,Tj'")
+    a, b = [p.strip() for p in s.split(",", 1)]
+    return a, b
+
+def _norm_label(lab: str) -> str:
+    if not lab:
+        return "NoRel"
+    m = lab.strip().lower()
+    if m in ("causeeffect", "cause-effect", "causes", "cause->effect"):
+        return "CauseEffect"
+    if m in ("effectcause", "effect-cause", "causedby", "caused_by", "effect->cause"):
+        return "EffectCause"
+    if m in ("norel", "no-rel", "no_relation", "no-relation", "none"):
+        return "NoRel"
+    return lab.strip()
+
+@tool
+def counterfactual_pairs(
+    *,
+    pair: str,
+    # Pass the full document text that was shown to the model (contains <T*> tags).
+    # The tool will instruct the model to read only; no rewriting needed.
+    context_text: str,
+    # Optional: spans for convenience/debug; not required.
+    span_i: Optional[str] = None,
+    span_j: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Decide the MECI label for ONE ordered pair "Ti,Tj" by running two counterfactual tests.
+
+    - Uses a but-for analysis in BOTH directions:
+        • Could Tj still happen if Ti did NOT happen?
+        • Could Ti still happen if Tj did NOT happen?
+      Treat enablement and prevention as causal.
+
+    Args:
+      pair: "Ti,Tj" (ordered)
+      context_text: the exact document text (read-only; do NOT rewrite)
+      span_i, span_j: optional trigger strings for Ti/Tj (debugging only)
+      model: optional model override
+
+    Returns:
+      {
+        "pair": "Ti,Tj",
+        "label": "CauseEffect|EffectCause|NoRel",
+        "confidence": float in [0,1],
+        "tests": {
+          "i_without_j": "yes|no|unclear",
+          "j_without_i": "yes|no|unclear"
+        }
+      }
+    """
+    Ti, Tj = _norm_pair_str(pair)
+    llm = _make_llm(model=model, temperature=0.0)
+
+    system = (
+        "You are a careful MECI counterfactual annotator. Use ONLY the label set:\n"
+        '- "CauseEffect" (Ti → Tj)\n'
+        '- "EffectCause" (Tj → Ti)\n'
+        '- "NoRel"\n\n'
+        "Causality includes enablement and prevention. Reject mere temporal order or correlation. "
+        "Do not paraphrase or rewrite the context; read it as-is and decide."
+    )
+
+    human = f"""
+Context (read-only; do NOT rewrite):
+{context_text}
+
+Pair: {Ti},{Tj}
+Event {Ti} span: {span_i or "[from context]"}
+Event {Tj} span: {span_j or "[from context]"}
+
+Task:
+1) Run the two but-for tests using ONLY the context:
+   - Test A (j_without_i): Could {Tj} still happen if {Ti} did NOT happen? Answer yes/no/unclear.
+   - Test B (i_without_j): Could {Ti} still happen if {Tj} did NOT happen? Answer yes/no/unclear.
+   Treat enablement and prevention as causal.
+
+2) Choose exactly ONE label from {{CauseEffect, EffectCause, NoRel}}:
+   - If {Ti} is necessary for {Tj} (A = no) and {Tj} is NOT necessary for {Ti} (B = yes): label = CauseEffect.
+   - If {Tj} is necessary for {Ti} (B = no) and {Ti} is NOT necessary for {Tj} (A = yes): label = EffectCause.
+   - If both could still happen (A = yes and B = yes): label = NoRel.
+   - If neither could still happen (A = no and B = no): pick the better-supported DIRECTION from explicit cues
+     (connectives like “because/so/therefore”, enable/prevent, polarity). If still tied, prefer the direction that
+     is most explicitly stated; as a last resort, default to CauseEffect.
+
+3) Output ONLY valid JSON (no prose), with this exact shape:
+{{
+  "pair": "{Ti},{Tj}",
+  "label": "CauseEffect|EffectCause|NoRel",
+  "confidence": 0.0,
+  "tests": {{
+    "i_without_j": "yes|no|unclear",
+    "j_without_i": "yes|no|unclear"
+  }}
+}}
+"""
+
+    raw = _llm_content(llm, system, human)
+
+    # Try to parse; be robust to minor formatting issues.
+    data: Dict[str, Any]
+    try:
+        data = json.loads(raw)
+    except Exception:
+        # Fallback: extract a label token if JSON parsing fails
+        m = re.search(r'"label"\s*:\s*"([^"]+)"', raw)
+        lab = _norm_label(m.group(1) if m else "")
+        data = {
+            "pair": f"{Ti},{Tj}",
+            "label": lab if lab in ("CauseEffect", "EffectCause", "NoRel") else "NoRel",
+            "confidence": 0.0,
+            "tests": {"i_without_j": "unclear", "j_without_i": "unclear"},
+        }
+
+    # Normalize label and pair, ensure required keys
+    data["pair"] = f"{Ti},{Tj}"
+    data["label"] = _norm_label(str(data.get("label", "")))
+    if data["label"] not in ("CauseEffect", "EffectCause", "NoRel"):
+        data["label"] = "NoRel"
+    if "confidence" not in data or not isinstance(data["confidence"], (int, float)):
+        data["confidence"] = 0.0
+    if "tests" not in data or not isinstance(data["tests"], dict):
+        data["tests"] = {"i_without_j": "unclear", "j_without_i": "unclear"}
+
+    return data
+
+
 
 # -------- Role tools now pull prompts from config --------
 
@@ -334,6 +467,7 @@ TOOL_REGISTRY: Dict[str, Any] = {
     "critic": critic,
     "summarizer": summarizer,
     "worker": worker,
+    "counterfactual_pairs": counterfactual_pairs,  # NEW
 }
 
 # Read enabled tool names from config (default to just coherence_check)

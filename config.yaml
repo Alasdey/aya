@@ -4,7 +4,7 @@ model: "openai/gpt-5-mini"                  # any OpenRouter model id works
 temperature: 0
 
 # LangSmith tracing
-langsmith_project: "no-tools-test"
+langsmith_project: "coherence-counterfactual-pairs"
 
 # Demo thread id (preserves conversation history via checkpointer)
 thread_id: "demo-thread-001"
@@ -16,7 +16,8 @@ paths:
 # Tools enabled
 tools:
   enabled:
-    # - coherence_check
+    - coherence_check
+    - counterfactual_pairs
     # - thinker
     # - critic
     # - summarizer
@@ -28,8 +29,7 @@ prompts:
   system:
     base: |
       You are a careful MECI annotator. Use tools whenever they can improve correctness.
-      - Tools available: coherence_check.
-      # - You MUST call the available tools as needed.
+      - You MUST call the available tools as needed.
       - Keep calling tools until you are confident the solution is correct (no fixed protocol; use judgment).
       - Events are trigger spans only; relations are directional and include cause/enablement/prevention.
       - Final answers must follow the JSON shape requested.
@@ -53,7 +53,7 @@ prompts:
       ## Tool guidance (optional, iterative)
       - You may call any tools, in any order, as many times as useful.
       - Typical but not mandatory uses:
-        • coherence_check → detect/fix directional asymmetry or missing reverses
+        • coherence_check → counterfactual_pairs -> detect/fix directional asymmetry or missing reverses
       - Stop when: labels are well-justified, directions are consistent, and all requested pairs are covered.
 
       ## Decision checklist (apply silently)
@@ -61,6 +61,8 @@ prompts:
       2) Pick the best direction (A→B vs B→A); include enablement/prevention as causal.
       3) Reject temporal-only or correlation-only links.
       4) Keep scope within the provided text window.
+
+      You MUST call the counterfactual pair only on  pairs that are uncertain
 
     user_template: |
       Text:

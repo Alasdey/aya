@@ -137,7 +137,10 @@ async def predict_meci_hf_async(
 
             # IMPORTANT: unique thread_id per task to avoid checkpointer clashes
             thread_id = f"meci::predict::{split}::{doc_idx}::b{batch_idx}::{uuid.uuid4().hex[:8]}"
-            cfg = {"configurable": {"thread_id": thread_id}, "tags": ["meci", "predict", split]}
+            cfg = {
+                "configurable": {"thread_id": thread_id, "recursion_limit": 100}, 
+                "tags": ["meci", "predict", split]
+                }
 
             with tracing_context(
                 name="doc_predict_async",
@@ -145,7 +148,10 @@ async def predict_meci_hf_async(
                 tags=["meci", "doc", "predict", "async"],
             ):
                 try:
-                    final = await graph.ainvoke({"messages": [sys_msg, user_msg]}, config=cfg)
+                    final = await graph.ainvoke(
+                        {"messages": [sys_msg, user_msg]}, 
+                        config=cfg,
+                        )
                     arr = _extract_last_json_array(final["messages"])
                 except Exception as e:
                     print(f"[WARN] async tool/model error at doc {doc_idx} batch {batch_idx}: {e}", file=sys.stderr)
