@@ -24,7 +24,7 @@ import uuid
 from tools.tools import TOOLS
 from prompts.meci import _meci_system_prompt, _meci_user_prompt
 from utils.metrics import compute_multiclass_metrics, compute_binary_metrics
-from utils.run_logger import capture_git_state, log_run
+from utils.logger import capture_git_state, log_run
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))

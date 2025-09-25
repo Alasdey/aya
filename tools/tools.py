@@ -15,6 +15,28 @@ from langsmith.run_helpers import traceable  # <- LangSmith tracing
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
+
+@tool
+def placeholder_tool(
+    *,
+    input: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    A placeholder tool for software development purposes.
+    This tool explicitly does nothing and returns a static message.
+    It can be used as a stub during testing or prototyping.
+    It MUST NOT be called by the model
+
+    Args:
+        input: Optional input string (ignored).
+
+    Returns:
+        {"message": "This is a placeholder tool and does nothing."}
+    """
+    return {"message": "This is a placeholder tool and does nothing."}
+
+
+
 CAUSAL = {"CauseEffect", "EffectCause"}
 
 def _inverse_label(lab: str) -> str:
@@ -462,12 +484,13 @@ def worker(
 
 # Registry of available tool objects by name
 TOOL_REGISTRY: Dict[str, Any] = {
+    "placeholder_tool": placeholder_tool,
     "coherence_check": coherence_check,
     "thinker": thinker,
     "critic": critic,
     "summarizer": summarizer,
     "worker": worker,
-    "counterfactual_pairs": counterfactual_pairs,  # NEW
+    "counterfactual_pairs": counterfactual_pairs,
 }
 
 # Read enabled tool names from config (default to just coherence_check)
