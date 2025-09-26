@@ -104,6 +104,36 @@ def _pred_map_from_json(arr: List[Dict[str, Any]], requested_pairs: List[tuple[s
     return pred_map
 
 
+# ---- Model via OpenRouter (OpenAI-compatible) ----
+llm = ChatOpenAI(
+    model=CONFIG["model"],
+    temperature=CONFIG.get("temperature", 0),
+    api_key=os.environ.get("OPENROUTER_API_KEY"),
+    base_url=CONFIG.get("openrouter_base_url", "https://openrouter.ai/api/v1"),
+)
+
+llm_with_tools = llm.bind_tools(TOOLS).with_config({"run_name": "chat_model+tools"})
+
+def should_continue(state: MessagesState) -> str:
+    last = state["messages"][-1]
+    return "tools" if getattr(last, "tool_calls", None) else END
+
+def call_model(state: MessagesState, *, config=None):
+    messages: List[AnyMessage] = state["messages"]
+    ai = llm_with_tools.invoke(messages, config=config)
+    return {"messages": [ai]}
+
+
+builder = StateGraph(MessagesState)
+builder.add_node("call_model", call_model)
+builder.add_node("tools", ToolNode(TOOLS).with_config({"run_name": "tool_node"}))
+builder.add_edge(START, "call_model")
+builder.add_conditional_edges("call_model", should_continue, ["tools", END])
+builder.add_edge("tools", "call_model")
+
+checkpointer = InMemorySaver()
+graph = builder.compile(checkpointer=checkpointer)
+
 async def predict_meci_hf_async(
     repo_id: str,
     split: str = "test",
@@ -232,35 +262,6 @@ async def predict_meci_hf_async(
     }
     return report
 
-# ---- Model via OpenRouter (OpenAI-compatible) ----
-llm = ChatOpenAI(
-    model=CONFIG["model"],
-    temperature=CONFIG.get("temperature", 0),
-    api_key=os.environ.get("OPENROUTER_API_KEY"),
-    base_url=CONFIG.get("openrouter_base_url", "https://openrouter.ai/api/v1"),
-)
-
-llm_with_tools = llm.bind_tools(TOOLS).with_config({"run_name": "chat_model+tools"})
-
-def should_continue(state: MessagesState) -> str:
-    last = state["messages"][-1]
-    return "tools" if getattr(last, "tool_calls", None) else END
-
-def call_model(state: MessagesState, *, config=None):
-    messages: List[AnyMessage] = state["messages"]
-    ai = llm_with_tools.invoke(messages, config=config)
-    return {"messages": [ai]}
-
-
-builder = StateGraph(MessagesState)
-builder.add_node("call_model", call_model)
-builder.add_node("tools", ToolNode(TOOLS).with_config({"run_name": "tool_node"}))
-builder.add_edge(START, "call_model")
-builder.add_conditional_edges("call_model", should_continue, ["tools", END])
-builder.add_edge("tools", "call_model")
-
-checkpointer = InMemorySaver()
-graph = builder.compile(checkpointer=checkpointer)
 
 # ---- Demo helper (now returns config-based system prompt) ----
 def _system_prompt() -> str:
