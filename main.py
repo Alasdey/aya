@@ -22,7 +22,11 @@ import uuid
 
 # Tools
 from tools.tools import TOOLS
-from prompts.meci import _meci_system_prompt, _meci_user_prompt
+from prompts.meci import (
+    _meci_system_prompt,
+    _meci_user_template_prefix,
+    _pair_line,
+)
 from utils.metrics import compute_multiclass_metrics, compute_binary_metrics
 from utils.logger import capture_git_state, log_run
 
@@ -118,6 +122,77 @@ def should_continue(state: MessagesState) -> str:
     last = state["messages"][-1]
     return "tools" if getattr(last, "tool_calls", None) else END
 
+
+# --- NEW: cache-friendly, independent bootstrap (no tools) ---
+async def cached_pairwise_bootstrap(state: MessagesState, *, config=None):
+    """
+    Run pairwise predictions by directly calling the base LLM with a stable prefix
+    (rules + doc text + 'Pairs to classify:' header). Each request only appends one
+    trailing pair line, maximizing prefix/prompt cache reuse across the batch.
+    """
+    cfg = (config or {}).get("configurable", {}) or {}
+    doc_text: str = cfg.get("doc_text", "") or ""
+    spans: Dict[str, str] = cfg.get("spans", {}) or {}
+    triples: List[tuple[str, str, str]] = cfg.get("pairs", []) or []
+    max_workers: int = int(cfg.get("bootstrap_concurrency", 16))
+
+    # Stable, long prefix for prompt caching
+    sys_seed = SystemMessage(_meci_system_prompt())
+    cached_prefix = _meci_user_template_prefix(doc_text)
+
+    sem = asyncio.Semaphore(max_workers)
+
+    async def _classify_one(Ti: str, Tj: str):
+        pair_line = _pair_line(Ti, Tj, spans)
+        user_msg = HumanMessage(cached_prefix + pair_line)
+        async with sem:
+            try:
+                ai = await llm.ainvoke([sys_seed, user_msg], config=config)
+                raw = (ai.content or "").strip()
+                label = "NoRel"
+                pair_key = f"{Ti},{Tj}"
+                try:
+                    if raw.startswith("```"):
+                        parts = raw.split("```")
+                        raw = next((p for p in parts if "[" in p and "]" in p), raw)
+                    if "[" in raw and "]" in raw:
+                        arr = json.loads(raw[raw.find("["): raw.rfind("]")+1])
+                        if isinstance(arr, list) and arr:
+                            obj = arr[0]
+                            if isinstance(obj, dict) and (obj.get("pair") or "").strip() == pair_key:
+                                label = (obj.get("label") or "").strip()
+                    else:
+                        obj = json.loads(raw)
+                        if isinstance(obj, dict) and (obj.get("pair") or "").strip() == pair_key:
+                            label = (obj.get("label") or "").strip()
+                except Exception:
+                    import re as _re
+                    m = _re.search(r'"label"\s*:\s*"([^"]+)"', raw)
+                    label = (m.group(1) if m else "NoRel").strip()
+
+                labmap = {
+                    "causeeffect": "CauseEffect",
+                    "effectcause": "EffectCause",
+                    "norel": "NoRel",
+                }
+                norm = labmap.get(label.lower(), label)
+                if norm not in {"CauseEffect", "EffectCause", "NoRel"}:
+                    norm = "NoRel"
+                return {"pair": pair_key, "label": norm}
+            except Exception as e:
+                return {"pair": f"{Ti},{Tj}", "label": "NoRel", "error": str(e)}
+
+    tasks = [_classify_one(Ti, Tj) for (Ti, _gold, Tj) in triples]
+    preds = await asyncio.gather(*tasks)
+
+    seed_json = json.dumps(preds, ensure_ascii=False, indent=2)
+    seed_msg = SystemMessage(
+        "Initial pairwise predictions (cache-friendly seed; treat as fallible hints):\n"
+        f"```json\n{seed_json}\n```"
+    )
+    return {"messages": [seed_msg]}
+
+
 def call_model(state: MessagesState, *, config=None):
     messages: List[AnyMessage] = state["messages"]
     ai = llm_with_tools.invoke(messages, config=config)
@@ -125,14 +200,17 @@ def call_model(state: MessagesState, *, config=None):
 
 
 builder = StateGraph(MessagesState)
+builder.add_node("cached_pairwise_bootstrap", cached_pairwise_bootstrap)
 builder.add_node("call_model", call_model)
 builder.add_node("tools", ToolNode(TOOLS).with_config({"run_name": "tool_node"}))
-builder.add_edge(START, "call_model")
+builder.add_edge(START, "cached_pairwise_bootstrap")
+builder.add_edge("cached_pairwise_bootstrap", "call_model")
 builder.add_conditional_edges("call_model", should_continue, ["tools", END])
 builder.add_edge("tools", "call_model")
 
 checkpointer = InMemorySaver()
 graph = builder.compile(checkpointer=checkpointer)
+
 
 async def predict_meci_hf_async(
     repo_id: str,
@@ -164,12 +242,22 @@ async def predict_meci_hf_async(
                         spans: Dict[str, str], batch: List[tuple[str, str, str]]):
         async with sem:
             sys_msg = SystemMessage(_meci_system_prompt())
-            user_msg = HumanMessage(_meci_user_prompt(doc_text, batch, spans))
 
-            # IMPORTANT: unique thread_id per task to avoid checkpointer clashes
+            # Cache-friendly user text: stable prefix + trailing pair lines
+            prefix = _meci_user_template_prefix(doc_text)
+            pair_lines = "\n".join(_pair_line(Ti, Tj, spans) for (Ti, _gold, Tj) in batch)
+            user_msg = HumanMessage(prefix + pair_lines)
+
             thread_id = f"meci::predict::{split}::{doc_idx}::b{batch_idx}::{uuid.uuid4().hex[:8]}"
             cfg = {
-                "configurable": {"thread_id": thread_id, "recursion_limit": 100}, 
+                "configurable": {
+                    "thread_id": thread_id,
+                    "recursion_limit": 100,
+                    "doc_text": doc_text,
+                    "spans": spans,
+                    "pairs": batch,
+                    "bootstrap_concurrency": max_concurrency,
+                },
                 "tags": ["meci", "predict", split]
                 }
 
@@ -262,13 +350,6 @@ async def predict_meci_hf_async(
     }
     return report
 
-
-# ---- Demo helper (now returns config-based system prompt) ----
-def _system_prompt() -> str:
-    return CONFIG["prompts"]["system"]["base"]
-
-def _sample_prompt() -> str:
-    return "Use the coherence check tool with a made up sample to test it"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

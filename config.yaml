@@ -1,10 +1,10 @@
 # OpenRouter + model routing
 openrouter_base_url: "https://openrouter.ai/api/v1"   # OpenAI-compatible endpoint
-model: "openai/gpt-5-mini"                  # any OpenRouter model id works
+model: "openai/gpt-5"                  # any OpenRouter model id works
 temperature: 0
 
 # LangSmith tracing
-langsmith_project: "dev-runs"
+langsmith_project: "pariwise-notools-gpt5-5-test"
 # langsmith_project: "dev-runs"
 
 # Demo thread id (preserves conversation history via checkpointer)
@@ -56,12 +56,6 @@ tools:
 #       4) Keep scope within the provided text window.
 
 #     user_template: |
-#       Text:
-#       {doc_text}
-
-#       Pairs to classify (use EXACT pair ids; output order does NOT matter):
-#       {pair_lines}
-
 #       Rules:
 #       - Labels: "CauseEffect" | "EffectCause" | "NoRel".
 #       - Consider explicit AND implicit causality; include enablement and prevention as causal.
@@ -73,6 +67,12 @@ tools:
 #       - Symmetry: "Ti,Tj" "CauseEffect" implies that "Tj,Ti" "EffectCause" and inversly
 #       - Missing: Any relation you leave missing will be considered a NoRel
 #       - Relations: "Tj,Ti" "NoRel" is not compatible with either "Ti,Tj" "CauseEffect" or "Ti,Tj" "CauseEffect"
+      
+#       Text:
+#       {doc_text}
+
+#       Pairs to classify (use EXACT pair ids; output order does NOT matter):
+#       {pair_lines}
 
 
 # All prompts 
@@ -112,6 +112,7 @@ prompts:
       2) Pick the best direction (A→B vs B→A); include enablement/prevention as causal.
       3) Reject temporal-only or correlation-only links.
       4) Keep scope within the provided text window.
+      5) Check that no other event may be a more direct cause, if yes, "NoRel"
 
       You MUST call the counterfactual pair only on pairs that are uncertain
       You MUST call the counterfacutal pair at least once
