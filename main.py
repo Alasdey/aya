@@ -37,6 +37,9 @@ CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 os.environ.setdefault("LANGSMITH_TRACING", "true")
 os.environ["LANGSMITH_PROJECT"] = CONFIG["langsmith_project"]
 
+if not os.environ.get("LANGSMITH_API_KEY"):
+    raise RuntimeError("LANGSMITH_API_KEY not set.")
+
 if not os.environ.get("OPENROUTER_API_KEY"):
     raise RuntimeError("OPENROUTER_API_KEY not set. See https://openrouter.ai/docs/quickstart")
 
@@ -204,6 +207,7 @@ builder.add_node("cached_pairwise_bootstrap", cached_pairwise_bootstrap)
 builder.add_node("call_model", call_model)
 builder.add_node("tools", ToolNode(TOOLS).with_config({"run_name": "tool_node"}))
 builder.add_edge(START, "cached_pairwise_bootstrap")
+# builder.add_edge(START, "call_model")
 builder.add_edge("cached_pairwise_bootstrap", "call_model")
 builder.add_conditional_edges("call_model", should_continue, ["tools", END])
 builder.add_edge("tools", "call_model")
