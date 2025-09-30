@@ -262,12 +262,12 @@ async def predict_meci_hf_async(
             cfg = {
                 "configurable": {
                     "thread_id": thread_id,
-                    "recursion_limit": 100,
                     "doc_text": doc_text,
                     "spans": spans,
                     "pairs": batch,
                     "bootstrap_concurrency": max_concurrency,
                 },
+                "recursion_limit": 100,
                 "tags": ["meci", "predict", split]
                 }
 
@@ -280,7 +280,7 @@ async def predict_meci_hf_async(
                     final = await graph.ainvoke(
                         {"messages": [sys_msg, user_msg]}, 
                         config=cfg,
-                        )
+                    )
                     arr = _extract_last_json_array(final["messages"])
                 except Exception as e:
                     print(f"[WARN] async tool/model error at doc {doc_idx} batch {batch_idx}: {e}", file=sys.stderr)
