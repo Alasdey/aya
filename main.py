@@ -4,6 +4,7 @@ import os
 import argparse
 import json
 import sys
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional  # <- add these for type hints
 
@@ -30,6 +31,8 @@ from prompts.meci import (
 from utils.metrics import compute_multiclass_metrics, compute_binary_metrics
 from utils.logger import capture_git_state, log_run
 
+print("Imports done")
+
 ROOT = Path(__file__).resolve().parent
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 
@@ -37,15 +40,13 @@ CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 os.environ.setdefault("LANGSMITH_TRACING", "true")
 os.environ["LANGSMITH_PROJECT"] = CONFIG["langsmith_project"]
 
+print("Config loaded")
+
 if not os.environ.get("LANGSMITH_API_KEY"):
     raise RuntimeError("LANGSMITH_API_KEY not set.")
 
 if not os.environ.get("OPENROUTER_API_KEY"):
     raise RuntimeError("OPENROUTER_API_KEY not set. See https://openrouter.ai/docs/quickstart")
-
-
-# NEW imports
-import re
 
 # ---- MECI parsing helpers (inline span format) ----
 PAIR_LABELS = {"CauseEffect", "EffectCause", "NoRel"}
@@ -201,13 +202,17 @@ def call_model(state: MessagesState, *, config=None):
     ai = llm_with_tools.invoke(messages, config=config)
     return {"messages": [ai]}
 
+print("Graph building")
 
 builder = StateGraph(MessagesState)
 builder.add_node("cached_pairwise_bootstrap", cached_pairwise_bootstrap)
 builder.add_node("call_model", call_model)
 builder.add_node("tools", ToolNode(TOOLS).with_config({"run_name": "tool_node"}))
-builder.add_edge(START, "cached_pairwise_bootstrap")
-# builder.add_edge(START, "call_model")
+if CONFIG["inference"]["initial_prediction_mode"] == "pairwise":
+    print("Pairwise initial prediction")
+    builder.add_edge(START, "cached_pairwise_bootstrap")
+else:
+    builder.add_edge(START, "call_model")
 builder.add_edge("cached_pairwise_bootstrap", "call_model")
 builder.add_conditional_edges("call_model", should_continue, ["tools", END])
 builder.add_edge("tools", "call_model")
@@ -215,6 +220,7 @@ builder.add_edge("tools", "call_model")
 checkpointer = InMemorySaver()
 graph = builder.compile(checkpointer=checkpointer)
 
+print("Graph built")
 
 async def predict_meci_hf_async(
     repo_id: str,
@@ -298,23 +304,27 @@ async def predict_meci_hf_async(
                 continue
             spans = extract_event_spans(doc_text)
 
+            print("Running async batch", end="\r")
             for b_idx, batch in enumerate(chunked(gold_triples, pair_batch_size)):
                 tasks.append(asyncio.create_task(run_batch(idx, b_idx, doc_text, spans, batch)))
 
+        print("Async results")
         # Gather results as they complete
         for coro in asyncio.as_completed(tasks):
             doc_idx, y_true, y_pred = await coro
+            print("Async checked", end="\r")
             labels_all_true.extend(y_true)
             labels_all_pred.extend(y_pred)
             d = per_doc.setdefault(doc_idx, {"y_true": [], "y_pred": []})
             d["y_true"].extend(y_true)
             d["y_pred"].extend(y_pred)
 
+    print("Compute metrics")
     labels = ["CauseEffect", "EffectCause", "NoRel"]
     mc = compute_multiclass_metrics(labels_all_true, labels_all_pred, labels)
     binm = compute_binary_metrics(labels_all_true, labels_all_pred)
 
-
+    print("Compute per doc metrics")
     # ---- Per-document metrics (compute + log into trace metadata) ----
     per_doc_metrics: List[Dict[str, Any]] = []
     for doc_idx, d in sorted(per_doc.items(), key=lambda x: x[0]):
@@ -341,6 +351,7 @@ async def predict_meci_hf_async(
             # no-op body; metadata is what we want on the trace
             pass
 
+    print("Repporting")
     report = {
         "per_label": mc["per_label"],
         "macro_f1": mc["macro_f1"],
@@ -371,6 +382,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     git = capture_git_state(ROOT)
+
+    print("Launching Async runs")
 
     res = asyncio.run(
         predict_meci_hf_async(
