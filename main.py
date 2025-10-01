@@ -22,6 +22,7 @@ from langchain_openai import ChatOpenAI
 
 import asyncio
 import uuid
+from collections import defaultdict  # NEW: For per_lang defaultdict
 
 # Tools
 from tools.tools import TOOLS
@@ -122,9 +123,11 @@ def _should_retry_exception(e: Exception) -> bool:
     retryable_patterns = [
         "timeout", "connection", "rate", "limit", "service unavailable",
         "internal server error", "bad gateway", "gateway timeout",
-        "temporary", "transient", "overloaded", "throttled"
+        "temporary", "transient", "overloaded", "throttled", 
+        "JSONDecodeError",
     ]
-    return any(pattern in error_msg for pattern in retryable_patterns)
+    # return any(pattern in error_msg for pattern in retryable_patterns)
+    return True
 
 async def _async_retry_with_backoff(
     coro_func, 
@@ -330,9 +333,10 @@ async def predict_meci_hf_async(
     sem = asyncio.Semaphore(max_concurrency)
     tasks: List[asyncio.Task] = []
     per_doc: Dict[int, Dict[str, List[str]]] = {}  # {doc_idx: {"y_true": [...], "y_pred": [...]}}
+    per_lang = defaultdict(lambda: {"y_true": [], "y_pred": []})  # NEW: Collect per language
 
     async def run_batch_with_retry(doc_idx: int, batch_idx: int, doc_text: str,
-                                  spans: Dict[str, str], batch: List[tuple[str, str, str]]):
+                                  spans: Dict[str, str], batch: List[tuple[str, str, str]], lang: str):  # NEW: Added lang param
         async def run_batch_attempt():
             async with sem:
                 sys_msg = SystemMessage(_meci_system_prompt())
@@ -369,7 +373,7 @@ async def predict_meci_hf_async(
                 pred_map = _pred_map_from_json(arr, batch)
                 y_true = [gold for (_Ti, gold, _Tj) in batch]
                 y_pred = [pred_map.get((Ti, Tj), "NoRel") for (Ti, _gold, Tj) in batch]
-                return doc_idx, y_true, y_pred
+                return doc_idx, lang, y_true, y_pred  # NEW: Return lang too
         
         try:
             return await _async_retry_with_backoff(
@@ -383,7 +387,7 @@ async def predict_meci_hf_async(
             # Return fallback predictions (all NoRel) to keep the evaluation running
             y_true = [gold for (_Ti, gold, _Tj) in batch]
             y_pred = ["NoRel" for _ in batch]
-            return doc_idx, y_true, y_pred
+            return doc_idx, lang, y_true, y_pred  # NEW: Return lang too
 
     with tracing_context(name="meci_predict_hf_async", metadata={"repo_id": repo_id, "split": split}, tags=["eval","meci","predict","async"]):
         for idx, row in enumerate(it):
@@ -396,10 +400,11 @@ async def predict_meci_hf_async(
                 skipped += 1
                 continue
             spans = extract_event_spans(doc_text)
+            lang = row.get("lang", "unknown")  # NEW: Extract lang from row
 
-            print(f"Processing document {idx} with {len(gold_triples)} pairs", end="\r")
+            print(f"Processing document {idx} ({lang}) with {len(gold_triples)} pairs", end="\r")
             for b_idx, batch in enumerate(chunked(gold_triples, pair_batch_size)):
-                tasks.append(asyncio.create_task(run_batch_with_retry(idx, b_idx, doc_text, spans, batch)))
+                tasks.append(asyncio.create_task(run_batch_with_retry(idx, b_idx, doc_text, spans, batch, lang)))  # NEW: Pass lang
 
         print("Gathering async results...")
         # Gather results as they complete
@@ -407,7 +412,7 @@ async def predict_meci_hf_async(
         total_batches = len(tasks)
         
         for coro in asyncio.as_completed(tasks):
-            doc_idx, y_true, y_pred = await coro
+            doc_idx, lang, y_true, y_pred = await coro  # NEW: Unpack lang
             completed_batches += 1
             print(f"Completed batch {completed_batches}/{total_batches}", end="\r")
             
@@ -416,6 +421,11 @@ async def predict_meci_hf_async(
             d = per_doc.setdefault(doc_idx, {"y_true": [], "y_pred": []})
             d["y_true"].extend(y_true)
             d["y_pred"].extend(y_pred)
+
+            # NEW: Append to per_lang
+            l = per_lang[lang]
+            l["y_true"].extend(y_true)
+            l["y_pred"].extend(y_pred)
 
     print("Computing metrics...")
     labels = ["CauseEffect", "EffectCause", "NoRel"]
@@ -449,6 +459,20 @@ async def predict_meci_hf_async(
             # no-op body; metadata is what we want on the trace
             pass
 
+    # NEW: Compute per-language metrics
+    print("Computing per-language metrics...")
+    per_lang_metrics: Dict[str, Dict[str, Any]] = {}
+    for lg, ld in per_lang.items():
+        if not ld["y_true"]:
+            continue
+        mc_l = compute_multiclass_metrics(ld["y_true"], ld["y_pred"], labels)
+        binm_l = compute_binary_metrics(ld["y_true"], ld["y_pred"])
+        per_lang_metrics[lg] = {
+            "multiclass": mc_l,
+            "binary": binm_l,
+            "total_pairs": len(ld["y_true"]),
+        }
+
     print("Generating report...")
     report = {
         "per_label": mc["per_label"],
@@ -460,6 +484,7 @@ async def predict_meci_hf_async(
         "binary": binm,
         "skipped_docs": skipped,
         "per_doc_metrics": per_doc_metrics,
+        "per_lang_metrics": per_lang_metrics,  # NEW: Add per-language metrics to report
     }
     return report
 

@@ -48,6 +48,22 @@ def flatten_per_label(results: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+# NEW: Flatten per-language metrics (micro only, as requested)
+def flatten_per_lang(results: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
+    per_lang_metrics = results.get("per_lang_metrics", {}) or {}
+    known_langs = ["causal-en", "causal-da", "causal-es", "causal-tr", "causal-ur"]  # Based on dataset
+    for lang in known_langs:
+        mc = safe_get(per_lang_metrics, [lang, "multiclass"], {})
+        out[f"{lang}_micro_precision"] = mc.get("micro_precision")
+        out[f"{lang}_micro_recall"] = mc.get("micro_recall")
+        out[f"{lang}_micro_f1"] = mc.get("micro_f1")
+        # Optional: Add more (e.g., macro_f1, total_pairs) if needed
+        # out[f"{lang}_macro_f1"] = mc.get("macro_f1")
+        # out[f"{lang}_total_pairs"] = per_lang_metrics.get(lang, {}).get("total_pairs")
+    return out
+
+
 def extract_row(data: Dict[str, Any], fname: str) -> Dict[str, Any]:
     row = {
         # helpful identifiers
@@ -79,6 +95,10 @@ def extract_row(data: Dict[str, Any], fname: str) -> Dict[str, Any]:
     # per-label metric columns
     per_label_cols = flatten_per_label(safe_get(data, ["results"]) or {})
     row.update(per_label_cols)
+
+    # NEW: per-language metric columns
+    per_lang_cols = flatten_per_lang(safe_get(data, ["results"]) or {})
+    row.update(per_lang_cols)
 
     return row
 
@@ -116,6 +136,10 @@ def main():
         "micro_precision", "micro_recall", "micro_f1",
         "skipped_docs",
     ]
+    # NEW: Add per-language columns to preferred
+    for lang in ["causal-en", "causal-da", "causal-es", "causal-tr", "causal-ur"]:
+        preferred.extend([f"{lang}_micro_precision", f"{lang}_micro_recall", f"{lang}_micro_f1"])
+
     # Move preferred to front, keep the rest (including per-label columns) afterward
     cols_front = [c for c in preferred if c in df.columns]
     cols_rest = [c for c in df.columns if c not in cols_front]
