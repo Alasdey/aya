@@ -1,5 +1,7 @@
 div_scripts
 logs/
+per_lang_summary.xlsx
+runs_summary.xlsx
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
