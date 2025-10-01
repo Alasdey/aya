@@ -5,6 +5,8 @@ import argparse
 import json
 import sys
 import re
+import random
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional  # <- add these for type hints
 
@@ -112,6 +114,77 @@ def _pred_map_from_json(arr: List[Dict[str, Any]], requested_pairs: List[tuple[s
     return pred_map
 
 
+# ---- Retry utility functions ----
+def _should_retry_exception(e: Exception) -> bool:
+    """Determine if an exception is worth retrying."""
+    # Retry on network errors, rate limits, timeouts, and general API errors
+    error_msg = str(e).lower()
+    retryable_patterns = [
+        "timeout", "connection", "rate", "limit", "service unavailable",
+        "internal server error", "bad gateway", "gateway timeout",
+        "temporary", "transient", "overloaded", "throttled"
+    ]
+    return any(pattern in error_msg for pattern in retryable_patterns)
+
+async def _async_retry_with_backoff(
+    coro_func, 
+    max_retries: int = 3, 
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    backoff_factor: float = 2.0,
+    jitter: bool = True,
+    *args, 
+    **kwargs
+):
+    """
+    Retry an async function with exponential backoff.
+    
+    Args:
+        coro_func: Async function to retry
+        max_retries: Maximum number of retry attempts (default: 3)  
+        base_delay: Initial delay in seconds (default: 1.0)
+        max_delay: Maximum delay in seconds (default: 60.0)
+        backoff_factor: Exponential backoff multiplier (default: 2.0)
+        jitter: Whether to add random jitter to delays (default: True)
+        *args, **kwargs: Arguments to pass to coro_func
+    
+    Returns:
+        Result of coro_func if successful
+        
+    Raises:
+        Last exception encountered if all retries fail
+    """
+    last_exception = None
+    
+    for attempt in range(max_retries + 1):  # +1 to include initial attempt
+        try:
+            return await coro_func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            
+            if attempt == max_retries:
+                # Final attempt failed, re-raise
+                print(f"[ERROR] Final retry attempt {attempt + 1}/{max_retries + 1} failed: {e}", file=sys.stderr)
+                raise e
+            
+            # Check if this exception is worth retrying
+            if not _should_retry_exception(e):
+                print(f"[WARN] Non-retryable error on attempt {attempt + 1}: {e}", file=sys.stderr)
+                raise e
+                
+            # Calculate delay with exponential backoff
+            delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+            
+            # Add jitter to prevent thundering herd
+            if jitter:
+                delay = delay * (0.5 + random.random() * 0.5)  # 50%-100% of delay
+                
+            print(f"[RETRY] Attempt {attempt + 1}/{max_retries + 1} failed: {e}. Retrying in {delay:.2f}s", file=sys.stderr)
+            await asyncio.sleep(delay)
+    
+    # Should never reach here, but just in case
+    raise last_exception
+
 # ---- Model via OpenRouter (OpenAI-compatible) ----
 llm = ChatOpenAI(
     model=CONFIG["model"],
@@ -127,12 +200,13 @@ def should_continue(state: MessagesState) -> str:
     return "tools" if getattr(last, "tool_calls", None) else END
 
 
-# --- NEW: cache-friendly, independent bootstrap (no tools) ---
+# --- NEW: cache-friendly, independent bootstrap (no tools) with retry ---
 async def cached_pairwise_bootstrap(state: MessagesState, *, config=None):
     """
     Run pairwise predictions by directly calling the base LLM with a stable prefix
     (rules + doc text + 'Pairs to classify:' header). Each request only appends one
     trailing pair line, maximizing prefix/prompt cache reuse across the batch.
+    Now includes retry logic for individual LLM calls.
     """
     cfg = (config or {}).get("configurable", {}) or {}
     doc_text: str = cfg.get("doc_text", "") or ""
@@ -146,11 +220,11 @@ async def cached_pairwise_bootstrap(state: MessagesState, *, config=None):
 
     sem = asyncio.Semaphore(max_workers)
 
-    async def _classify_one(Ti: str, Tj: str):
-        pair_line = _pair_line(Ti, Tj, spans)
-        user_msg = HumanMessage(cached_prefix + pair_line)
-        async with sem:
-            try:
+    async def _classify_one_with_retry(Ti: str, Tj: str):
+        async def _classify_one_attempt():
+            pair_line = _pair_line(Ti, Tj, spans)
+            user_msg = HumanMessage(cached_prefix + pair_line)
+            async with sem:
                 ai = await llm.ainvoke([sys_seed, user_msg], config=config)
                 raw = (ai.content or "").strip()
                 label = "NoRel"
@@ -176,17 +250,26 @@ async def cached_pairwise_bootstrap(state: MessagesState, *, config=None):
 
                 labmap = {
                     "causeeffect": "CauseEffect",
-                    "effectcause": "EffectCause",
+                    "effectcause": "EffectCause", 
                     "norel": "NoRel",
                 }
                 norm = labmap.get(label.lower(), label)
                 if norm not in {"CauseEffect", "EffectCause", "NoRel"}:
                     norm = "NoRel"
                 return {"pair": pair_key, "label": norm}
-            except Exception as e:
-                return {"pair": f"{Ti},{Tj}", "label": "NoRel", "error": str(e)}
+        
+        try:
+            return await _async_retry_with_backoff(
+                _classify_one_attempt,
+                max_retries=3,
+                base_delay=1.0,
+                max_delay=30.0
+            )
+        except Exception as e:
+            print(f"[ERROR] All retries failed for pair {Ti},{Tj}: {e}", file=sys.stderr)
+            return {"pair": f"{Ti},{Tj}", "label": "NoRel", "error": str(e)}
 
-    tasks = [_classify_one(Ti, Tj) for (Ti, _gold, Tj) in triples]
+    tasks = [_classify_one_with_retry(Ti, Tj) for (Ti, _gold, Tj) in triples]
     preds = await asyncio.gather(*tasks)
 
     seed_json = json.dumps(preds, ensure_ascii=False, indent=2)
@@ -235,7 +318,7 @@ async def predict_meci_hf_async(
 ):
     """
     Async version: schedules **each batch** for a document as a separate task and runs them concurrently.
-    Uses graph.ainvoke under the hood.
+    Uses graph.ainvoke under the hood. Now includes retry logic for batch processing.
     """
     ds = load_dataset(repo_id, split=split, streaming=streaming)
     it = ds if streaming else [ds[i] for i in range(len(ds))]
@@ -248,48 +331,58 @@ async def predict_meci_hf_async(
     tasks: List[asyncio.Task] = []
     per_doc: Dict[int, Dict[str, List[str]]] = {}  # {doc_idx: {"y_true": [...], "y_pred": [...]}}
 
-    async def run_batch(doc_idx: int, batch_idx: int, doc_text: str,
-                        spans: Dict[str, str], batch: List[tuple[str, str, str]]):
-        async with sem:
-            sys_msg = SystemMessage(_meci_system_prompt())
+    async def run_batch_with_retry(doc_idx: int, batch_idx: int, doc_text: str,
+                                  spans: Dict[str, str], batch: List[tuple[str, str, str]]):
+        async def run_batch_attempt():
+            async with sem:
+                sys_msg = SystemMessage(_meci_system_prompt())
 
-            # Cache-friendly user text: stable prefix + trailing pair lines
-            prefix = _meci_user_template_prefix(doc_text)
-            pair_lines = "\n".join(_pair_line(Ti, Tj, spans) for (Ti, _gold, Tj) in batch)
-            user_msg = HumanMessage(prefix + pair_lines)
+                # Cache-friendly user text: stable prefix + trailing pair lines
+                prefix = _meci_user_template_prefix(doc_text)
+                pair_lines = "\n".join(_pair_line(Ti, Tj, spans) for (Ti, _gold, Tj) in batch)
+                user_msg = HumanMessage(prefix + pair_lines)
 
-            thread_id = f"meci::predict::{split}::{doc_idx}::b{batch_idx}::{uuid.uuid4().hex[:8]}"
-            cfg = {
-                "configurable": {
-                    "thread_id": thread_id,
-                    "doc_text": doc_text,
-                    "spans": spans,
-                    "pairs": batch,
-                    "bootstrap_concurrency": max_concurrency,
-                },
-                "recursion_limit": 100,
-                "tags": ["meci", "predict", split]
+                thread_id = f"meci::predict::{split}::{doc_idx}::b{batch_idx}::{uuid.uuid4().hex[:8]}"
+                cfg = {
+                    "configurable": {
+                        "thread_id": thread_id,
+                        "doc_text": doc_text,
+                        "spans": spans,
+                        "pairs": batch,
+                        "bootstrap_concurrency": max_concurrency,
+                    },
+                    "recursion_limit": 100,
+                    "tags": ["meci", "predict", split]
                 }
 
-            with tracing_context(
-                name="doc_predict_async",
-                metadata={"doc_idx": doc_idx, "batch_idx": batch_idx, "num_pairs": len(batch)},
-                tags=["meci", "doc", "predict", "async"],
-            ):
-                try:
+                with tracing_context(
+                    name="doc_predict_async",
+                    metadata={"doc_idx": doc_idx, "batch_idx": batch_idx, "num_pairs": len(batch)},
+                    tags=["meci", "doc", "predict", "async"],
+                ):
                     final = await graph.ainvoke(
                         {"messages": [sys_msg, user_msg]}, 
                         config=cfg,
                     )
                     arr = _extract_last_json_array(final["messages"])
-                except Exception as e:
-                    print(f"[WARN] async tool/model error at doc {doc_idx} batch {batch_idx}: {e}", file=sys.stderr)
-                    arr = []
 
-            pred_map = _pred_map_from_json(arr, batch)
+                pred_map = _pred_map_from_json(arr, batch)
+                y_true = [gold for (_Ti, gold, _Tj) in batch]
+                y_pred = [pred_map.get((Ti, Tj), "NoRel") for (Ti, _gold, Tj) in batch]
+                return doc_idx, y_true, y_pred
+        
+        try:
+            return await _async_retry_with_backoff(
+                run_batch_attempt,
+                max_retries=3,
+                base_delay=2.0,
+                max_delay=60.0
+            )
+        except Exception as e:
+            print(f"[ERROR] All retries failed for doc {doc_idx} batch {batch_idx}: {e}", file=sys.stderr)
+            # Return fallback predictions (all NoRel) to keep the evaluation running
             y_true = [gold for (_Ti, gold, _Tj) in batch]
-            y_pred = [pred_map.get((Ti, Tj), "NoRel") for (Ti, _gold, Tj) in batch]
-            # include doc_idx so caller can bucket by document
+            y_pred = ["NoRel" for _ in batch]
             return doc_idx, y_true, y_pred
 
     with tracing_context(name="meci_predict_hf_async", metadata={"repo_id": repo_id, "split": split}, tags=["eval","meci","predict","async"]):
@@ -304,27 +397,32 @@ async def predict_meci_hf_async(
                 continue
             spans = extract_event_spans(doc_text)
 
-            print("Running async batch", end="\r")
+            print(f"Processing document {idx} with {len(gold_triples)} pairs", end="\r")
             for b_idx, batch in enumerate(chunked(gold_triples, pair_batch_size)):
-                tasks.append(asyncio.create_task(run_batch(idx, b_idx, doc_text, spans, batch)))
+                tasks.append(asyncio.create_task(run_batch_with_retry(idx, b_idx, doc_text, spans, batch)))
 
-        print("Async results")
+        print("Gathering async results...")
         # Gather results as they complete
+        completed_batches = 0
+        total_batches = len(tasks)
+        
         for coro in asyncio.as_completed(tasks):
             doc_idx, y_true, y_pred = await coro
-            print("Async checked", end="\r")
+            completed_batches += 1
+            print(f"Completed batch {completed_batches}/{total_batches}", end="\r")
+            
             labels_all_true.extend(y_true)
             labels_all_pred.extend(y_pred)
             d = per_doc.setdefault(doc_idx, {"y_true": [], "y_pred": []})
             d["y_true"].extend(y_true)
             d["y_pred"].extend(y_pred)
 
-    print("Compute metrics")
+    print("Computing metrics...")
     labels = ["CauseEffect", "EffectCause", "NoRel"]
     mc = compute_multiclass_metrics(labels_all_true, labels_all_pred, labels)
     binm = compute_binary_metrics(labels_all_true, labels_all_pred)
 
-    print("Compute per doc metrics")
+    print("Computing per-document metrics...")
     # ---- Per-document metrics (compute + log into trace metadata) ----
     per_doc_metrics: List[Dict[str, Any]] = []
     for doc_idx, d in sorted(per_doc.items(), key=lambda x: x[0]):
@@ -342,7 +440,7 @@ async def predict_meci_hf_async(
             "binary": binm_d,
         }
         per_doc_metrics.append(doc_report)
-        # Emit a child trace with metrics in metadata so it’s easily inspectable in LangSmith UI
+        # Emit a child trace with metrics in metadata so it's easily inspectable in LangSmith UI
         with tracing_context(
             name="doc_metrics",
             metadata=doc_report,
@@ -351,7 +449,7 @@ async def predict_meci_hf_async(
             # no-op body; metadata is what we want on the trace
             pass
 
-    print("Repporting")
+    print("Generating report...")
     report = {
         "per_label": mc["per_label"],
         "macro_f1": mc["macro_f1"],
@@ -383,7 +481,7 @@ if __name__ == "__main__":
 
     git = capture_git_state(ROOT)
 
-    print("Launching Async runs")
+    print("Launching async runs with retry logic...")
 
     res = asyncio.run(
         predict_meci_hf_async(
