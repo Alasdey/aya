@@ -4,7 +4,7 @@ model: "openai/gpt-5-mini"                  # any OpenRouter model id works
 temperature: 0
 
 # LangSmith tracing
-langsmith_project: "all_at_once-alltools-gpt5mini-715-newerprompt-test-2"
+langsmith_project: "all_at_once-alltools-gpt5mini-715-resample3-test"
 # langsmith_project: "dev-runs"
 
 # Demo thread id (preserves conversation history via checkpointer)
@@ -31,6 +31,15 @@ inference:
   #   - "pairwise" (current behavior): one cached request per pair for maximal prompt-cache hit rate
   #   - "all_at_once": a single request for the whole batch
   initial_prediction_mode: "all_at_once"   # or "all_at_once"
+
+# Resampling configuration
+resampling:
+  enabled: true
+  n_runs: 3  # Number of independent predictions per document batch
+  aggregation: "majority_vote"  # or "confidence_weighted"
+  tie_breaking: "norel" #"random"  # random selection for ties
+  parallel_execution: true  # Run predictions in parallel
+  max_concurrency_per_run: 100  # Reduce concurrency per run when doing multiple runs
 
 # All prompts 
 prompts:

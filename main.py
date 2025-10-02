@@ -33,6 +33,7 @@ from prompts.meci import (
 )
 from utils.metrics import compute_multiclass_metrics, compute_binary_metrics
 from utils.logger import capture_git_state, log_run
+from utils.resampling import *
 
 print("Imports done")
 
@@ -308,7 +309,7 @@ graph = builder.compile(checkpointer=checkpointer)
 
 print("Graph built")
 
-async def predict_meci_hf_async(
+async def predict_meci_hf_async_with_resampling(
     repo_id: str,
     split: str = "test",
     text_field: str = "text",
@@ -318,6 +319,9 @@ async def predict_meci_hf_async(
     streaming: bool = False,
     ls_project: Optional[str] = None,
     max_concurrency: int = 8,
+    n_resampling_runs: int = 3,
+    enable_resampling: bool = True,
+    tie_breaking: str = "random", 
 ):
     """
     Async version: schedules **each batch** for a document as a separate task and runs them concurrently.
@@ -330,14 +334,83 @@ async def predict_meci_hf_async(
     labels_all_pred: List[str] = []
     skipped = 0
 
-    sem = asyncio.Semaphore(max_concurrency)
+    # Adjust concurrency when doing multiple runs
+    effective_concurrency = max_concurrency // n_resampling_runs if enable_resampling else max_concurrency
+    sem = asyncio.Semaphore(effective_concurrency)
+    
     tasks: List[asyncio.Task] = []
     per_doc: Dict[int, Dict[str, List[str]]] = {}  # {doc_idx: {"y_true": [...], "y_pred": [...]}}
+
     per_lang = defaultdict(lambda: {"y_true": [], "y_pred": []})  # NEW: Collect per language
 
-    async def run_batch_with_retry(doc_idx: int, batch_idx: int, doc_text: str,
-                                  spans: Dict[str, str], batch: List[tuple[str, str, str]], lang: str):  # NEW: Added lang param
-        async def run_batch_attempt():
+    # NEW: Track resampling statistics
+    resampling_stats = {
+        "total_batches_resampled": 0,
+        "aggregation_stats": [],
+        "per_doc_resampling": {}
+    }
+
+    async def run_batch_with_resampling(
+        doc_idx: int, batch_idx: int, doc_text: str,
+        spans: Dict[str, str], batch: List[Tuple[str, str, str]], lang: str
+    ):
+        """Run multiple independent predictions and aggregate them"""
+        
+        if not enable_resampling:
+            # Fall back to single prediction
+            return await run_single_batch(doc_idx, batch_idx, doc_text, spans, batch, lang)
+        
+        # Run multiple independent predictions
+        independent_tasks = []
+        for run_idx in range(n_resampling_runs):
+            independent_tasks.append(
+                run_single_batch_independent(
+                    doc_idx, batch_idx, run_idx, doc_text, spans, batch, lang
+                )
+            )
+        
+        # Execute all runs concurrently
+        with tracing_context(
+            name="resampled_batch_predict",
+            metadata={
+                "doc_idx": doc_idx, 
+                "batch_idx": batch_idx, 
+                "n_runs": n_resampling_runs,
+                "num_pairs": len(batch),
+                "tie_breaking": tie_breaking
+            },
+            tags=["meci", "resampling", "batch", f"tie_{tie_breaking}"],
+        ):
+            independent_results = await asyncio.gather(*independent_tasks)
+        
+        # Aggregate predictions using majority voting with configured tie-breaking
+        predictions = [result["predictions"] for result in independent_results]
+        final_preds, agg_stats = majority_vote_with_configurable_tiebreak(
+            predictions, batch, tie_breaking=tie_breaking
+        )
+        
+        # Track resampling statistics
+        resampling_stats["total_batches_resampled"] += 1
+        resampling_stats["aggregation_stats"].append(agg_stats)
+        resampling_stats["per_doc_resampling"][f"{doc_idx}_{batch_idx}"] = {
+            "individual_runs": independent_results,
+            "aggregation": agg_stats
+        }
+        
+        # Convert to standard format
+        pred_map = _pred_map_from_json(final_preds, batch)
+        y_true = [gold for (_Ti, gold, _Tj) in batch]
+        y_pred = [pred_map.get((Ti, Tj), "NoRel") for (Ti, _gold, Tj) in batch]
+        
+        return doc_idx, lang, y_true, y_pred
+
+    async def run_single_batch_independent(
+        doc_idx: int, batch_idx: int, run_idx: int, doc_text: str,
+        spans: Dict[str, str], batch: List[Tuple[str, str, str]], lang: str
+    ):
+        """Run a single independent prediction with unique thread ID"""
+        
+        async def run_attempt():
             async with sem:
                 sys_msg = SystemMessage(_meci_system_prompt())
 
@@ -345,23 +418,31 @@ async def predict_meci_hf_async(
                 prefix = _meci_user_template_prefix(doc_text)
                 pair_lines = "\n".join(_pair_line(Ti, Tj, spans) for (Ti, _gold, Tj) in batch)
                 user_msg = HumanMessage(prefix + pair_lines)
-
-                thread_id = f"meci::predict::{split}::{doc_idx}::b{batch_idx}::{uuid.uuid4().hex[:8]}"
+                
+                # CRITICAL: Unique thread ID for independence
+                thread_id = f"meci::resample::{split}::{doc_idx}::b{batch_idx}::r{run_idx}::{uuid.uuid4().hex[:8]}"
+                
                 cfg = {
                     "configurable": {
-                        "thread_id": thread_id,
+                        "thread_id": thread_id,  # Ensures independence
                         "doc_text": doc_text,
                         "spans": spans,
                         "pairs": batch,
-                        "bootstrap_concurrency": max_concurrency,
+                        "bootstrap_concurrency": effective_concurrency,
+                        "run_idx": run_idx,  # For debugging/tracing
                     },
                     "recursion_limit": 100,
                     "tags": ["meci", "predict", split]
                 }
 
                 with tracing_context(
-                    name="doc_predict_async",
-                    metadata={"doc_idx": doc_idx, "batch_idx": batch_idx, "num_pairs": len(batch)},
+                    name="independent_predict",
+                    metadata={
+                        "doc_idx": doc_idx, 
+                        "batch_idx": batch_idx, 
+                        "run_idx": run_idx,
+                        "thread_id": thread_id
+                    },
                     tags=["meci", "doc", "predict", "async"],
                 ):
                     final = await graph.ainvoke(
@@ -369,27 +450,42 @@ async def predict_meci_hf_async(
                         config=cfg,
                     )
                     arr = _extract_last_json_array(final["messages"])
-
-                pred_map = _pred_map_from_json(arr, batch)
-                y_true = [gold for (_Ti, gold, _Tj) in batch]
-                y_pred = [pred_map.get((Ti, Tj), "NoRel") for (Ti, _gold, Tj) in batch]
-                return doc_idx, lang, y_true, y_pred  # NEW: Return lang too
+                    
+                return {
+                    "run_idx": run_idx,
+                    "thread_id": thread_id,
+                    "predictions": arr,
+                    "messages": len(final["messages"])
+                }
         
         try:
             return await _async_retry_with_backoff(
-                run_batch_attempt,
+                run_attempt,
                 max_retries=3,
                 base_delay=2.0,
                 max_delay=60.0
             )
         except Exception as e:
-            print(f"[ERROR] All retries failed for doc {doc_idx} batch {batch_idx}: {e}", file=sys.stderr)
-            # Return fallback predictions (all NoRel) to keep the evaluation running
-            y_true = [gold for (_Ti, gold, _Tj) in batch]
-            y_pred = ["NoRel" for _ in batch]
-            return doc_idx, lang, y_true, y_pred  # NEW: Return lang too
+            print(f"[ERROR] Independent run {run_idx} failed for doc {doc_idx} batch {batch_idx}: {e}", file=sys.stderr)
+            # Fallback: return NoRel predictions
+            fallback_preds = [{"pair": f"{Ti},{Tj}", "label": "NoRel"} for (Ti, _gold, Tj) in batch]
+            return {
+                "run_idx": run_idx,
+                "predictions": fallback_preds,
+                "error": str(e)
+            }
 
-    with tracing_context(name="meci_predict_hf_async", metadata={"repo_id": repo_id, "split": split}, tags=["eval","meci","predict","async"]):
+    # Main processing loop (similar to original but using resampling function)
+    with tracing_context(
+        name="meci_predict_resampled", 
+        metadata={
+            "repo_id": repo_id, 
+            "split": split, 
+            "resampling_enabled": enable_resampling,
+            "n_runs": n_resampling_runs if enable_resampling else 1
+        }, 
+        tags=["eval","meci","predict","resampling"]
+    ):
         for idx, row in enumerate(it):
             if max_examples and idx >= max_examples:
                 break
@@ -400,13 +496,16 @@ async def predict_meci_hf_async(
                 skipped += 1
                 continue
             spans = extract_event_spans(doc_text)
-            lang = row.get("lang", "unknown")  # NEW: Extract lang from row
+            lang = row.get("lang", "unknown")
 
-            print(f"Processing document {idx} ({lang}) with {len(gold_triples)} pairs", end="\r")
+            print(f"Processing document {idx} ({lang}) with {len(gold_triples)} pairs - Resampling: {n_resampling_runs if enable_resampling else 1} runs    ", end="\r")
+            
             for b_idx, batch in enumerate(chunked(gold_triples, pair_batch_size)):
-                tasks.append(asyncio.create_task(run_batch_with_retry(idx, b_idx, doc_text, spans, batch, lang)))  # NEW: Pass lang
+                tasks.append(asyncio.create_task(
+                    run_batch_with_resampling(idx, b_idx, doc_text, spans, batch, lang)
+                ))
 
-        print("Gathering async results...")
+        print("\nGathering async results...")
         # Gather results as they complete
         completed_batches = 0
         total_batches = len(tasks)
@@ -484,32 +583,47 @@ async def predict_meci_hf_async(
         "binary": binm,
         "skipped_docs": skipped,
         "per_doc_metrics": per_doc_metrics,
-        "per_lang_metrics": per_lang_metrics,  # NEW: Add per-language metrics to report
+        "per_lang_metrics": per_lang_metrics,
+        # Resampling statistics
+        "resampling": {
+            "enabled": enable_resampling,
+            "n_runs": n_resampling_runs if enable_resampling else 1,
+            "tie_breaking": tie_breaking if enable_resampling else None,
+            "stats": resampling_stats if enable_resampling else None
+        }
     }
+    
     return report
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repo", type=str, required=True, help="Hugging Face dataset name or path (e.g., your_org/meci_dataset)") 
+    parser.add_argument("--repo", type=str, required=True)
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--text_field", type=str, default="text")
     parser.add_argument("--ann_field", type=str, default="annots")
     parser.add_argument("--pair_batch_size", type=int, default=100)
-    parser.add_argument("--max_examples", type=int, default=0, help="0 = all")
-    parser.add_argument("--streaming", type=bool, default=False, help="Streaming")
-    parser.add_argument("--ls_project", type=str, required=False, help="Langsmith project name")
-    parser.add_argument("--concurrency", type=int, default=8, help="Max concurrent batch calls") 
-    parser.add_argument("--logdir", type=str, default="logs", help="Directory to write execution logs")
-
+    parser.add_argument("--max_examples", type=int, default=0)
+    parser.add_argument("--streaming", type=bool, default=False)
+    parser.add_argument("--ls_project", type=str, required=False)
+    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--logdir", type=str, default="logs")
+    
+    # Resampling arguments
+    parser.add_argument("--resampling", type=bool, default=CONFIG.get("resampling", {}).get("enabled", False))
+    parser.add_argument("--n_runs", type=int, default=CONFIG.get("resampling", {}).get("n_runs", 3))
+    parser.add_argument("--tie_breaking", type=str, 
+                       choices=["random", "norel"],
+                       default=CONFIG.get("resampling", {}).get("tie_breaking", "random"),
+                       help="Tie-breaking strategy: 'random' or 'norel'")
     args = parser.parse_args()
 
     git = capture_git_state(ROOT)
 
-    print("Launching async runs with retry logic...")
-
+    print(f"Launching with resampling: {args.resampling} (n_runs={args.n_runs if args.resampling else 1})")
+    
     res = asyncio.run(
-        predict_meci_hf_async(
+        predict_meci_hf_async_with_resampling(
             repo_id=args.repo,
             split=args.split,
             text_field=args.text_field,
@@ -519,6 +633,9 @@ if __name__ == "__main__":
             streaming=args.streaming,
             ls_project=args.ls_project,
             max_concurrency=args.concurrency,
+            n_resampling_runs=args.n_runs,
+            enable_resampling=args.resampling,
+            tie_breaking=args.tie_breaking, 
         )
     )
 
@@ -532,5 +649,6 @@ if __name__ == "__main__":
     )
 
     res.pop("per_doc_metrics")
+    res.pop("resampling")
     print(json.dumps(res, ensure_ascii=False, indent=2))
     sys.exit(0)
